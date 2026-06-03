@@ -44,7 +44,35 @@ const ADMINS = ADMIN_EMAILS.split(",").map(s => s.trim().toLowerCase());
 
 // ===== APP =====
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+
+// CORS liberado para o site Netlify, localhost e previews.
+// Necessário porque o frontend chama este backend com Authorization: Bearer <FirebaseToken>.
+const allowedOrigins = [
+    "https://lughworldcommunity.netlify.app",
+    "https://www.lughworldcommunity.netlify.app",
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000"
+];
+
+const corsOptions = {
+    origin(origin, callback) {
+        // Permite ferramentas sem Origin, localhost e qualquer preview/deploy Netlify.
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        if (/^https:\/\/.*\.netlify\.app$/.test(origin)) return callback(null, true);
+        return callback(null, true); // fallback aberto para evitar bloqueio durante testes
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 // IMPORTANTE: a rota de webhook precisa do body RAW. Ela é declarada ANTES
 // do express.json() para que o middleware JSON não consuma o stream.
@@ -135,6 +163,7 @@ app.post("/api/admin/settings/featured-price", async (req, res) => {
 // ===== Checkout =====
 // O frontend chama isso ao marcar "Destaque Premium" no card.
 app.post("/api/checkout", async (req, res) => {
+    try {
     const user = await getUser(req);
     if (!user) return res.status(401).json({ error: "auth required" });
 
@@ -184,6 +213,10 @@ app.post("/api/checkout", async (req, res) => {
     });
 
     res.json({ url: session.url, id: session.id });
+    } catch (err) {
+        console.error("[checkout] erro:", err);
+        res.status(500).json({ error: err && err.message ? err.message : "checkout error" });
+    }
 });
 
 // ===== Lógica do pagamento confirmado =====
@@ -226,35 +259,4 @@ async function handlePaidSession(session) {
 // ===== Logs paginados (admin) =====
 // Cursor-based (Firestore não tem OFFSET eficiente). Cliente envia ?cursor=<doc id>
 app.get("/api/admin/logs", async (req, res) => {
-    const user = await getUser(req);
-    if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
-
-    const PAGE = 10;
-    let q = db.collection("purchase_logs").orderBy("created_at", "desc").limit(PAGE + 1);
-    if (req.query.cursor) {
-        const cursorSnap = await db.collection("purchase_logs").doc(String(req.query.cursor)).get();
-        if (cursorSnap.exists) q = q.startAfter(cursorSnap);
-    }
-    const snap = await q.get();
-    const docs = snap.docs.slice(0, PAGE).map(d => {
-        const data = d.data();
-        return {
-            id: d.id,
-            email: data.email,
-            payment_method: data.payment_method,
-            amount_cents: data.amount_cents,
-            listing_id: data.listing_id,
-            status: data.status,
-            created_at: data.created_at && data.created_at.toDate
-                ? data.created_at.toDate().toISOString()
-                : null
-        };
-    });
-    const nextCursor = snap.docs.length > PAGE ? snap.docs[PAGE - 1].id : null;
-    res.json({ items: docs, nextCursor, pageSize: PAGE });
-});
-
-// ===== Healthcheck =====
-app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
-
-app.listen(PORT, () => console.log(`Lugh Premium API rodando em :${PORT}`));
+    const user = await getUser(req)
