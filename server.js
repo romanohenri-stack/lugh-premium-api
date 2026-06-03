@@ -259,4 +259,40 @@ async function handlePaidSession(session) {
 // ===== Logs paginados (admin) =====
 // Cursor-based (Firestore não tem OFFSET eficiente). Cliente envia ?cursor=<doc id>
 app.get("/api/admin/logs", async (req, res) => {
-    const user = await getUser(req)
+const user = await getUser(req)
+   if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
+
+    const PAGE = 10;
+    let q = db.collection("purchase_logs").orderBy("created_at", "desc").limit(PAGE + 1);
+
+    if (req.query.cursor) {
+        const cursorSnap = await db.collection("purchase_logs").doc(String(req.query.cursor)).get();
+        if (cursorSnap.exists) q = q.startAfter(cursorSnap);
+    }
+
+    const snap = await q.get();
+
+    const docs = snap.docs.slice(0, PAGE).map(d => {
+        const data = d.data();
+        return {
+            id: d.id,
+            email: data.email,
+            payment_method: data.payment_method,
+            amount_cents: data.amount_cents,
+            listing_id: data.listing_id,
+            status: data.status,
+            created_at: data.created_at && data.created_at.toDate
+                ? data.created_at.toDate().toISOString()
+                : null
+        };
+    });
+
+    const nextCursor = snap.docs.length > PAGE ? snap.docs[PAGE - 1].id : null;
+
+    res.json({ items: docs, nextCursor, pageSize: PAGE });
+});
+
+// ===== Healthcheck =====
+app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
+
+app.listen(PORT, () => console.log(`Lugh Premium API rodando em :${PORT}`));
