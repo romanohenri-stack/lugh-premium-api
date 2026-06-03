@@ -190,7 +190,7 @@ app.post("/api/checkout", async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
         mode: "payment",
-        payment_method_types: ["card"], // Cartão + Pix (QR Code gerado pelo Stripe)
+        payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
         line_items: [{
             price_data: {
                 currency: "brl",
