@@ -144,12 +144,13 @@ app.post("/api/checkout", async (req, res) => {
     }
 
     // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
-    // no seu projeto — ajuste o nome se necessário; aqui usamos "market_listings").
-    const listingRef = db.collection("market_listings").doc(listingId);
+    // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
+    const listingRef = db.collection("listings").doc(listingId);
     const listingSnap = await listingRef.get();
     if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
     const listing = listingSnap.data();
-    if (listing.ownerEmail && listing.ownerEmail.toLowerCase() !== user.email.toLowerCase()) {
+    const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
+    if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
         return res.status(403).json({ error: "anúncio não pertence ao usuário" });
     }
     if (listing.is_featured === true) {
@@ -197,7 +198,7 @@ async function handlePaidSession(session) {
 
     const batch = db.batch();
     // 1) marca o anúncio como destaque
-    const listingRef = db.collection("market_listings").doc(listingId);
+    const listingRef = db.collection("listings").doc(listingId);
     batch.set(listingRef, {
         is_featured: true,
         featured_at: admin.firestore.FieldValue.serverTimestamp(),
