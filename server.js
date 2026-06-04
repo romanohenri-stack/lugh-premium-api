@@ -232,11 +232,16 @@ async function handlePaidSession(session) {
     const batch = db.batch();
     // 1) marca o anúncio como destaque
     const listingRef = db.collection("listings").doc(listingId);
-    batch.set(listingRef, {
-        is_featured: true,
-        featured_at: admin.firestore.FieldValue.serverTimestamp(),
-        featured_session_id: session.id
-    }, { merge: true });
+    const now = admin.firestore.Timestamp.now();
+const premiumExpiresAtMs = now.toMillis() + 7 * 24 * 60 * 60 * 1000;
+
+batch.set(listingRef, {
+    is_featured: true,
+    featured_at: now,
+    featured_session_id: session.id,
+    premium_expires_at_ms: premiumExpiresAtMs,
+    expires_at_ms: premiumExpiresAtMs
+}, { merge: true });
 
     // 2) grava log de transação
     const logRef = db.collection("purchase_logs").doc(session.id);
