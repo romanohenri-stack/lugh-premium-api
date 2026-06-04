@@ -174,7 +174,7 @@ app.post("/api/checkout", async (req, res) => {
 
     // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
     // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    const listingRef = db.collection("listings").doc(listingId);
+    const listingRef = db.collection("market_listings").doc(listingId);
     const listingSnap = await listingRef.get();
     if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
     const listing = listingSnap.data();
