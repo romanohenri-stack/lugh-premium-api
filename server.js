@@ -231,7 +231,7 @@ async function handlePaidSession(session) {
 
     const batch = db.batch();
     // 1) marca o anúncio como destaque
-    const listingRef = db.collection("listings").doc(listingId);
+    const listingRef = db.collection("market_listings").doc(listingId);
     const now = admin.firestore.Timestamp.now();
 const premiumExpiresAtMs = now.toMillis() + 7 * 24 * 60 * 60 * 1000;
 
@@ -244,18 +244,19 @@ batch.set(listingRef, {
 }, { merge: true });
 
     // 2) grava log de transação
-    const logRef = db.collection("purchase_logs").doc(session.id);
-    batch.set(logRef, {
-        session_id: session.id,
-        listing_id: listingId,
-        user_id: meta.userId || null,
-        email: meta.userEmail || session.customer_email || null,
-        amount_cents: session.amount_total,
-        currency: session.currency,
-        payment_method: paymentMethod,
-        status: session.payment_status,
-        created_at: admin.firestore.FieldValue.serverTimestamp()
-    });
+const logRef = db.collection("purchase_logs").doc(session.id);
+batch.set(logRef, {
+    session_id: session.id,
+    listing_id: listingId,
+    user_id: meta.userId || null,
+    email: meta.userEmail || session.customer_email || null,
+    amount_cents: session.amount_total,
+    currency: session.currency,
+    payment_method: paymentMethod,
+    status: session.payment_status,
+    premium_expires_at_ms: premiumExpiresAtMs,
+    created_at: admin.firestore.FieldValue.serverTimestamp()
+});
 
     await batch.commit();
     console.log("[webhook] anúncio destacado + log gravado:", listingId, session.id);
