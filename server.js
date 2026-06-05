@@ -174,9 +174,19 @@ app.post("/api/checkout", async (req, res) => {
 
     // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
     // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    const listingRef = db.collection("market_listings").doc(listingId);
-    const listingSnap = await listingRef.get();
-    if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
+    let listingCollection = "market_listings";
+let listingRef = db.collection(listingCollection).doc(listingId);
+let listingSnap = await listingRef.get();
+
+if (!listingSnap.exists) {
+    listingCollection = "listings";
+    listingRef = db.collection(listingCollection).doc(listingId);
+    listingSnap = await listingRef.get();
+}
+
+if (!listingSnap.exists) {
+    return res.status(404).json({ error: "anúncio não encontrado" });
+}
     const listing = listingSnap.data();
     const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
     if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
@@ -188,28 +198,31 @@ app.post("/api/checkout", async (req, res) => {
 
     const cents = await getFeaturedPriceCents();
 
-    const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card"], // Cartão + Pix (QR Code gerado pelo Stripe)
-        line_items: [{
-            price_data: {
-                currency: "brl",
-                product_data: {
-                    name: `Destaque Premium — Anúncio ${listingId}`,
-                    description: "Aura dourada + prioridade no topo da listagem"
-                },
-                unit_amount: cents
+const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    payment_method_types: ["card"],
+    line_items: [{
+        price_data: {
+            currency: "brl",
+            product_data: {
+                name: `Destaque Premium — Anúncio ${listingId}`,
+                description: "Aura dourada + prioridade no topo da listagem"
             },
-            quantity: 1
-        }],
-        customer_email: user.email,
-        metadata: {
-            listingId,
-            userId: user.uid,
-            userEmail: user.email
+            unit_amount: cents
         },
-        success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
-        cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
+        quantity: 1
+    }],
+    customer_email: user.email,
+
+    metadata: {
+        listingId,
+        listingCollection,
+        userId: user.uid,
+        userEmail: user.email
+    },
+
+    success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
+    cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
     });
 
     res.json({ url: session.url, id: session.id });
@@ -231,7 +244,8 @@ async function handlePaidSession(session) {
 
     const batch = db.batch();
     // 1) marca o anúncio como destaque
-    const listingRef = db.collection("market_listings").doc(listingId);
+    const listingCollection = meta.listingCollection || "market_listings";
+const listingRef = db.collection(listingCollection).doc(listingId);
     const now = admin.firestore.Timestamp.now();
 const premiumExpiresAtMs = now.toMillis() + 7 * 24 * 60 * 60 * 1000;
 
