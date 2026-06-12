@@ -111,6 +111,34 @@ app.post("/api/webhook",
 
 // JSON para o restante das rotas
 app.use(express.json({ limit: "200kb" }));
+// ===== Steam News Proxy =====
+app.get("/api/steam-news", async (req, res) => {
+    try {
+        const appid = String(req.query.appid || "").trim();
+        const count = Math.min(Math.max(parseInt(req.query.count || "10", 10) || 10, 1), 20);
+
+        if (!appid) {
+            return res.status(400).json({ error: "appid obrigatório" });
+        }
+
+        const steamUrl = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${encodeURIComponent(appid)}&count=${encodeURIComponent(count)}&maxlength=30000&format=json`;
+        const response = await fetch(steamUrl);
+
+        if (!response.ok) {
+            return res.status(response.status).json({
+                error: `Steam HTTP ${response.status}`,
+                url: steamUrl
+            });
+        }
+
+        const data = await response.json();
+        res.json(data);
+    } catch (err) {
+        console.error("[steam-news] erro:", err);
+        res.status(500).json({ error: err && err.message ? err.message : "steam news error" });
+    }
+});
+
 
 // ===== Helpers de autenticação =====
 // Verifica o ID Token do Firebase enviado pelo frontend no header Authorization.
