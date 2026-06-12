@@ -1295,16 +1295,4 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
 // ===== Healthcheck =====
 app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
 
-const steamAutoImportMinutes = Math.max(0, Number(STEAM_NEWS_AUTO_IMPORT_MINUTES) || 0);
-if (steamAutoImportMinutes > 0) {
-    const steamAutoImportMs = steamAutoImportMinutes * 60 * 1000;
-    setTimeout(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import inicial falhou:", err));
-    }, 30000);
-    setInterval(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import falhou:", err));
-    }, steamAutoImportMs);
-    console.log(`[steam-news] importacao automatica ativa a cada ${steamAutoImportMinutes} minuto(s).`);
-}
-
 app.listen(PORT, () => console.log(`Lugh Premium API rodando em :${PORT}`));
