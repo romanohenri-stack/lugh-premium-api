@@ -45,7 +45,35 @@ const ADMINS = ADMIN_EMAILS.split(",").map(s => s.trim().toLowerCase());
 
 // ===== APP =====
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+
+// CORS liberado para o site Netlify, localhost e previews.
+// Necessário porque o frontend chama este backend com Authorization: Bearer <FirebaseToken>.
+const allowedOrigins = [
+    "https://lughworldcommunity.netlify.app",
+    "https://www.lughworldcommunity.netlify.app",
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000"
+];
+
+const corsOptions = {
+    origin(origin, callback) {
+        // Permite ferramentas sem Origin, localhost e qualquer preview/deploy Netlify.
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        if (/^https:\/\/.*\.netlify\.app$/.test(origin)) return callback(null, true);
+        return callback(null, true); // fallback aberto para evitar bloqueio durante testes
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 // IMPORTANTE: a rota de webhook precisa do body RAW. Ela é declarada ANTES
 // do express.json() para que o middleware JSON não consuma o stream.
@@ -136,6 +164,7 @@ app.post("/api/admin/settings/featured-price", async (req, res) => {
 // ===== Checkout =====
 // O frontend chama isso ao marcar "Destaque Premium" no card.
 app.post("/api/checkout", async (req, res) => {
+    try {
     const user = await getUser(req);
     if (!user) return res.status(401).json({ error: "auth required" });
 
@@ -146,9 +175,19 @@ app.post("/api/checkout", async (req, res) => {
 
     // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
     // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    const listingRef = db.collection("listings").doc(listingId);
-    const listingSnap = await listingRef.get();
-    if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
+    let listingCollection = "market_listings";
+let listingRef = db.collection(listingCollection).doc(listingId);
+let listingSnap = await listingRef.get();
+
+if (!listingSnap.exists) {
+    listingCollection = "listings";
+    listingRef = db.collection(listingCollection).doc(listingId);
+    listingSnap = await listingRef.get();
+}
+
+if (!listingSnap.exists) {
+    return res.status(404).json({ error: "anúncio não encontrado" });
+}
     const listing = listingSnap.data();
     const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
     if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
@@ -160,31 +199,38 @@ app.post("/api/checkout", async (req, res) => {
 
     const cents = await getFeaturedPriceCents();
 
-    const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
-        line_items: [{
-            price_data: {
-                currency: "brl",
-                product_data: {
-                    name: `Destaque Premium — Anúncio ${listingId}`,
-                    description: "Aura dourada + prioridade no topo da listagem"
-                },
-                unit_amount: cents
+const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    payment_method_types: ["card"],
+    line_items: [{
+        price_data: {
+            currency: "brl",
+            product_data: {
+                name: `Destaque Premium — Anúncio ${listingId}`,
+                description: "Aura dourada + prioridade no topo da listagem"
             },
-            quantity: 1
-        }],
-        customer_email: user.email,
-        metadata: {
-            listingId,
-            userId: user.uid,
-            userEmail: user.email
+            unit_amount: cents
         },
-        success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
-        cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
+        quantity: 1
+    }],
+    customer_email: user.email,
+
+    metadata: {
+        listingId,
+        listingCollection,
+        userId: user.uid,
+        userEmail: user.email
+    },
+
+    success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
+    cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
     });
 
     res.json({ url: session.url, id: session.id });
+    } catch (err) {
+        console.error("[checkout] erro:", err);
+        res.status(500).json({ error: err && err.message ? err.message : "checkout error" });
+    }
 });
 
 // ===== Lógica do pagamento confirmado =====
@@ -199,34 +245,33 @@ async function handlePaidSession(session) {
 
     const batch = db.batch();
     // 1) marca o anúncio como destaque
-    const listingRef = db.collection("listings").doc(listingId);
-    batch.set(listingRef, {
-        is_featured: true,
-        featured_at: admin.firestore.FieldValue.serverTimestamp(),
-        featured_session_id: session.id,
+    const listingCollection = meta.listingCollection || "market_listings";
+const listingRef = db.collection(listingCollection).doc(listingId);
+    const now = admin.firestore.Timestamp.now();
+const premiumExpiresAtMs = now.toMillis() + 7 * 24 * 60 * 60 * 1000;
 
-        // Validade do anúncio Premium:
-        // a partir da aprovação do pagamento, o anúncio ganha 7 dias completos.
-        // O frontend usa "date" para expiração automática, então resetamos para agora.
-        date: Date.now(),
-        premium_paid_at_ms: Date.now(),
-        premium_expires_at_ms: Date.now() + (7 * 24 * 60 * 60 * 1000),
-        expires_at_ms: Date.now() + (7 * 24 * 60 * 60 * 1000)
-    }, { merge: true });
+batch.set(listingRef, {
+    is_featured: true,
+    featured_at: now,
+    featured_session_id: session.id,
+    premium_expires_at_ms: premiumExpiresAtMs,
+    expires_at_ms: premiumExpiresAtMs
+}, { merge: true });
 
     // 2) grava log de transação
-    const logRef = db.collection("purchase_logs").doc(session.id);
-    batch.set(logRef, {
-        session_id: session.id,
-        listing_id: listingId,
-        user_id: meta.userId || null,
-        email: meta.userEmail || session.customer_email || null,
-        amount_cents: session.amount_total,
-        currency: session.currency,
-        payment_method: paymentMethod,
-        status: session.payment_status,
-        created_at: admin.firestore.FieldValue.serverTimestamp()
-    });
+const logRef = db.collection("purchase_logs").doc(session.id);
+batch.set(logRef, {
+    session_id: session.id,
+    listing_id: listingId,
+    user_id: meta.userId || null,
+    email: meta.userEmail || session.customer_email || null,
+    amount_cents: session.amount_total,
+    currency: session.currency,
+    payment_method: paymentMethod,
+    status: session.payment_status,
+    premium_expires_at_ms: premiumExpiresAtMs,
+    created_at: admin.firestore.FieldValue.serverTimestamp()
+});
 
     await batch.commit();
     console.log("[webhook] anúncio destacado + log gravado:", listingId, session.id);
@@ -235,16 +280,19 @@ async function handlePaidSession(session) {
 // ===== Logs paginados (admin) =====
 // Cursor-based (Firestore não tem OFFSET eficiente). Cliente envia ?cursor=<doc id>
 app.get("/api/admin/logs", async (req, res) => {
-    const user = await getUser(req);
-    if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
+const user = await getUser(req)
+   if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
 
     const PAGE = 10;
     let q = db.collection("purchase_logs").orderBy("created_at", "desc").limit(PAGE + 1);
+
     if (req.query.cursor) {
         const cursorSnap = await db.collection("purchase_logs").doc(String(req.query.cursor)).get();
         if (cursorSnap.exists) q = q.startAfter(cursorSnap);
     }
+
     const snap = await q.get();
+
     const docs = snap.docs.slice(0, PAGE).map(d => {
         const data = d.data();
         return {
@@ -259,7 +307,9 @@ app.get("/api/admin/logs", async (req, res) => {
                 : null
         };
     });
+
     const nextCursor = snap.docs.length > PAGE ? snap.docs[PAGE - 1].id : null;
+
     res.json({ items: docs, nextCursor, pageSize: PAGE });
 });
 
@@ -1244,60 +1294,6 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
 
 // ===== Healthcheck =====
 app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
-
-// ===== Manifest dinâmico de assets =====
-// Varre /assets em tempo real. Permite adicionar imagens sem rebuild.
-// O frontend (assets-bridge.js) tenta este endpoint primeiro e cai no
-// arquivo estático /assets/assets-manifest.json se este host não estiver
-// disponível (ex.: site servido em outro domínio).
-const fs = require("fs");
-const path = require("path");
-const ASSETS_DIR = path.join(__dirname, "assets");
-const ASSET_FOLDERS = {
-    "Lugs":              "lugs",
-    "Lugs Prismaticos":  "lugsPrismaticos",
-    "Loot":              "loot",
-    "Wallpapers":        "wallpapers",
-    "UI Icons":          "uiIcons",
-    "Maps":              "maps",
-    "Map icons":         "mapIcons"
-};
-const IMG_RX = /\.(png|jpe?g|gif|webp|avif|svg|bmp|ico)$/i;
-function resolveAssetDir(folderName) {
-    const direct = path.join(ASSETS_DIR, folderName);
-    if (fs.existsSync(direct)) return direct;
-    const lower = path.join(ASSETS_DIR, folderName.toLowerCase());
-    if (fs.existsSync(lower)) return lower;
-    return direct;
-}
-
-function listAssetImagesRecursive(dir, prefix = "") {
-    if (!fs.existsSync(dir)) return [];
-    const out = [];
-    for (const item of fs.readdirSync(dir)) {
-        if (item.startsWith(".")) continue;
-        const full = path.join(dir, item);
-        const rel = prefix ? path.posix.join(prefix, item) : item;
-        const st = fs.statSync(full);
-        if (st.isDirectory()) out.push(...listAssetImagesRecursive(full, rel));
-        else if (IMG_RX.test(item)) out.push(rel);
-    }
-    return out;
-}
-
-app.get("/api/assets-manifest", (_req, res) => {
-    try {
-        const out = {};
-        for (const folder of Object.keys(ASSET_FOLDERS)) {
-            out[ASSET_FOLDERS[folder]] = listAssetImagesRecursive(resolveAssetDir(folder))
-                .sort((a, b) => a.localeCompare(b, "pt-BR", { sensitivity: "base" }));
-        }
-        res.set("Cache-Control", "no-cache");
-        res.json(out);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
 
 const steamAutoImportMinutes = Math.max(0, Number(STEAM_NEWS_AUTO_IMPORT_MINUTES) || 0);
 if (steamAutoImportMinutes > 0) {
