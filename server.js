@@ -21,7 +21,6 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
-const fetch = require("node-fetch");
 
 // ===== ENV =====
 const {
@@ -112,38 +111,6 @@ app.post("/api/webhook",
 
 // JSON para o restante das rotas
 app.use(express.json({ limit: "200kb" }));
-app.get("/api/steam-news", async (req, res) => {
-  try {
-    const appid = req.query.appid;
-    const count = req.query.count || 10;
-
-    if (!appid) {
-      return res.status(400).json({
-        error: "appid obrigatório"
-      });
-    }
-
-    const url =
-      `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${appid}&count=${count}&maxlength=30000&format=json`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`Steam HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    res.json(data);
-
-  } catch (err) {
-    console.error("Steam News Error:", err);
-
-    res.status(500).json({
-      error: err.message
-    });
-  }
-});
 
 // ===== Helpers de autenticação =====
 // Verifica o ID Token do Firebase enviado pelo frontend no header Authorization.
