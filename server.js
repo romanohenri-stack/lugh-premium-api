@@ -1292,6 +1292,18 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
     }
 });
 
+
+
+// ===== Healthcheck para aquecer Render antes do Stripe =====
+app.get("/api/health", (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({
+        ok: true,
+        service: "lugh-premium-api",
+        timestamp: Date.now()
+    });
+});
+
 // ===== Healthcheck =====
 app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
 
