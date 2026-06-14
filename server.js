@@ -160,6 +160,24 @@ function decodeDiscordState(value) {
     return JSON.parse(Buffer.from(String(value || ""), "base64url").toString("utf8"));
 }
 
+function buildDiscordReturnUrl(status, state = {}) {
+    const redirectUrl = new URL(getPublicSiteUrl());
+    const returnTo = String(state.returnTo || "").trim();
+    const tab = String(state.tab || "").trim();
+    const open = String(state.open || "").trim();
+
+    if (returnTo === "createListing" || returnTo === "market-create-listing" || open === "createListing") {
+        redirectUrl.searchParams.set("tab", "market");
+        redirectUrl.searchParams.set("open", "createListing");
+    } else {
+        if (tab) redirectUrl.searchParams.set("tab", tab);
+        if (open) redirectUrl.searchParams.set("open", open);
+    }
+
+    redirectUrl.searchParams.set("discord", status);
+    return redirectUrl.toString();
+}
+
 app.get("/api/auth/discord/start", async (req, res) => {
     try {
         const user = await getUser(req);
@@ -174,7 +192,10 @@ app.get("/api/auth/discord/start", async (req, res) => {
         const state = encodeDiscordState({
             uid: user.uid,
             email: user.email || "",
-            t: Date.now()
+            t: Date.now(),
+            returnTo: String(req.query.returnTo || "").slice(0, 80),
+            tab: String(req.query.tab || "").slice(0, 40),
+            open: String(req.query.open || "").slice(0, 80)
         });
 
         const params = new URLSearchParams({
@@ -196,20 +217,29 @@ app.get("/api/auth/discord/callback", async (req, res) => {
     try {
         const code = String(req.query.code || "");
         const stateRaw = String(req.query.state || "");
+        const discordError = String(req.query.error || "");
+
+        let state = {};
+        if (stateRaw) {
+            try {
+                state = decodeDiscordState(stateRaw);
+            } catch (_) {
+                state = {};
+            }
+        }
+
+        // Quando o usuario clica em "Cancelar" no Discord, o OAuth volta com
+        // error=access_denied. Nao deve cair em pagina branca; retorna ao fluxo.
+        if (discordError) {
+            return res.redirect(buildDiscordReturnUrl("cancelled", state));
+        }
 
         if (!code || !stateRaw) {
             return res.status(400).send("Callback Discord invalido.");
         }
 
-        let state;
-        try {
-            state = decodeDiscordState(stateRaw);
-        } catch (_) {
-            return res.status(400).send("State Discord invalido.");
-        }
-
         if (!state.uid || Date.now() - Number(state.t || 0) > 10 * 60 * 1000) {
-            return res.status(400).send("Sessao Discord expirada.");
+            return res.redirect(buildDiscordReturnUrl("expired", state));
         }
 
         if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
@@ -264,9 +294,7 @@ app.get("/api/auth/discord/callback", async (req, res) => {
             discordLinkedAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        const redirectUrl = new URL(getPublicSiteUrl());
-        redirectUrl.searchParams.set("discord", "linked");
-        res.redirect(redirectUrl.toString());
+        res.redirect(buildDiscordReturnUrl("linked", state));
     } catch (err) {
         console.error("[discord-callback] erro:", err);
         res.status(500).send("Erro interno ao vincular Discord.");
