@@ -29,6 +29,9 @@ const {
     FIREBASE_SERVICE_ACCOUNT_JSON, // string JSON da service account
     PUBLIC_SITE_URL = "http://localhost:5173",
     ADMIN_EMAILS = "romanohenri@gmail.com",
+    DISCORD_CLIENT_ID,
+    DISCORD_CLIENT_SECRET,
+    DISCORD_REDIRECT_URI,
     STEAM_NEWS_AUTO_IMPORT_MINUTES = "30",
     PORT = 8787
 } = process.env;
@@ -118,15 +121,175 @@ app.use(express.json({ limit: "200kb" }));
 async function getUser(req) {
     const h = req.headers.authorization || "";
     const m = h.match(/^Bearer (.+)$/);
-    if (!m) return null;
+    const token = m ? m[1] : (req.query && req.query.token ? String(req.query.token) : "");
+    if (!token) return null;
     try {
-        const decoded = await admin.auth().verifyIdToken(m[1]);
+        const decoded = await admin.auth().verifyIdToken(token);
         return decoded;
     } catch { return null; }
 }
 function isAdmin(user) {
     return user && user.email && ADMINS.includes(user.email.toLowerCase());
 }
+
+// ===== Discord OAuth =====
+// Vincula uma conta Discord ao usuário Firebase logado.
+// Fluxo esperado no frontend:
+// 1) obter idToken do Firebase: currentUser.getIdToken()
+// 2) abrir: `${API_BASE}/api/auth/discord/start?token=${encodeURIComponent(idToken)}`
+// 3) callback salva users/{uid} com discordId/username/avatar e volta ao site.
+function getDiscordRedirectUri() {
+    return DISCORD_REDIRECT_URI || `${PUBLIC_SITE_URL.replace(/\/+$/, "")}/api/auth/discord/callback`;
+}
+
+function getPublicSiteUrl() {
+    return String(PUBLIC_SITE_URL || "http://localhost:5173").replace(/\/+$/, "");
+}
+
+function buildDiscordAvatarUrl(discordUser) {
+    if (!discordUser || !discordUser.id || !discordUser.avatar) return "";
+    const ext = String(discordUser.avatar).startsWith("a_") ? "gif" : "png";
+    return `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.${ext}?size=128`;
+}
+
+function encodeDiscordState(payload) {
+    return Buffer.from(JSON.stringify(payload)).toString("base64url");
+}
+
+function decodeDiscordState(value) {
+    return JSON.parse(Buffer.from(String(value || ""), "base64url").toString("utf8"));
+}
+
+app.get("/api/auth/discord/start", async (req, res) => {
+    try {
+        const user = await getUser(req);
+        if (!user) {
+            return res.status(401).send("Login Firebase necessario antes de vincular Discord.");
+        }
+
+        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+            return res.status(500).send("Discord OAuth nao configurado no servidor.");
+        }
+
+        const state = encodeDiscordState({
+            uid: user.uid,
+            email: user.email || "",
+            t: Date.now()
+        });
+
+        const params = new URLSearchParams({
+            client_id: DISCORD_CLIENT_ID,
+            redirect_uri: getDiscordRedirectUri(),
+            response_type: "code",
+            scope: "identify email",
+            state
+        });
+
+        res.redirect(`https://discord.com/oauth2/authorize?${params.toString()}`);
+    } catch (err) {
+        console.error("[discord-start] erro:", err);
+        res.status(500).send("Erro ao iniciar vinculacao Discord.");
+    }
+});
+
+app.get("/api/auth/discord/callback", async (req, res) => {
+    try {
+        const code = String(req.query.code || "");
+        const stateRaw = String(req.query.state || "");
+
+        if (!code || !stateRaw) {
+            return res.status(400).send("Callback Discord invalido.");
+        }
+
+        let state;
+        try {
+            state = decodeDiscordState(stateRaw);
+        } catch (_) {
+            return res.status(400).send("State Discord invalido.");
+        }
+
+        if (!state.uid || Date.now() - Number(state.t || 0) > 10 * 60 * 1000) {
+            return res.status(400).send("Sessao Discord expirada.");
+        }
+
+        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+            return res.status(500).send("Discord OAuth nao configurado no servidor.");
+        }
+
+        const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+                client_id: DISCORD_CLIENT_ID,
+                client_secret: DISCORD_CLIENT_SECRET,
+                grant_type: "authorization_code",
+                code,
+                redirect_uri: getDiscordRedirectUri()
+            })
+        });
+
+        if (!tokenResponse.ok) {
+            const body = await tokenResponse.text();
+            console.error("[discord-token] erro:", tokenResponse.status, body);
+            return res.status(502).send("Erro ao autorizar Discord.");
+        }
+
+        const tokenData = await tokenResponse.json();
+
+        const meResponse = await fetch("https://discord.com/api/users/@me", {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+
+        if (!meResponse.ok) {
+            const body = await meResponse.text();
+            console.error("[discord-me] erro:", meResponse.status, body);
+            return res.status(502).send("Erro ao buscar perfil Discord.");
+        }
+
+        const discordUser = await meResponse.json();
+        const username = String(discordUser.global_name || discordUser.username || "").trim();
+        const tag = discordUser.discriminator && discordUser.discriminator !== "0"
+            ? `${discordUser.username}#${discordUser.discriminator}`
+            : String(discordUser.username || "").trim();
+
+        await db.collection("users").doc(state.uid).set({
+            uid: state.uid,
+            email: state.email || null,
+            discordId: String(discordUser.id || ""),
+            discordUsername: username,
+            discordTag: tag,
+            discordAvatar: buildDiscordAvatarUrl(discordUser),
+            discordEmail: discordUser.email || null,
+            discordLinked: true,
+            discordLinkedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        const redirectUrl = new URL(getPublicSiteUrl());
+        redirectUrl.searchParams.set("discord", "linked");
+        res.redirect(redirectUrl.toString());
+    } catch (err) {
+        console.error("[discord-callback] erro:", err);
+        res.status(500).send("Erro interno ao vincular Discord.");
+    }
+});
+
+// Consulta leve do perfil Discord vinculado do usuário logado.
+// Usar no modal de criar anúncio para mostrar "Discord vinculado".
+app.get("/api/me/discord", async (req, res) => {
+    const user = await getUser(req);
+    if (!user) return res.status(401).json({ error: "auth required" });
+
+    const snap = await db.collection("users").doc(user.uid).get();
+    const data = snap.exists ? snap.data() : {};
+    res.json({
+        linked: !!(data && data.discordLinked && data.discordId),
+        discordId: data && data.discordId || "",
+        discordUsername: data && data.discordUsername || "",
+        discordTag: data && data.discordTag || "",
+        discordAvatar: data && data.discordAvatar || ""
+    });
+});
+
 
 // ===== Settings (preço do destaque) =====
 const SETTINGS_DOC = db.collection("settings").doc("market_premium");
