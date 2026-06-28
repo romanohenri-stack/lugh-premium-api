@@ -740,7 +740,7 @@ async function findExistingSteamNewsDocServer(game, item, record) {
 function shouldRebuildSteamNewsServer(existing) {
     const contentPt = existing && (existing.contentPt || existing.content && existing.content.pt);
     const contentEn = existing && (existing.contentEn || existing.content && existing.content.en);
-    return Number(existing && existing.formattingVersion || 0) < 11
+    return Number(existing && existing.formattingVersion || 0) < 12
         || !steamTextLooksPortuguese(contentPt, contentEn);
 }
 
@@ -1759,7 +1759,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 11,
+        formattingVersion: 12,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
