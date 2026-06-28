@@ -52,6 +52,9 @@ const ADMINS = ADMIN_EMAILS.split(",").map(s => s.trim().toLowerCase());
 // ===== APP =====
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
+// Preflight explicito para chamadas com Authorization do frontend Netlify.
+// Mantem o checkout acessivel mesmo quando o navegador envia OPTIONS antes do POST.
+app.options("*", cors({ origin: true, credentials: true }));
 
 // IMPORTANTE: a rota de webhook precisa do body RAW. Ela é declarada ANTES
 // do express.json() para que o middleware JSON não consuma o stream.
@@ -489,55 +492,65 @@ app.post("/api/admin/settings/featured-price", async (req, res) => {
 // ===== Checkout =====
 // O frontend chama isso ao marcar "Destaque Premium" no card.
 app.post("/api/checkout", async (req, res) => {
-    const user = await getUser(req);
-    if (!user) return res.status(401).json({ error: "auth required" });
+    try {
+        const user = await getUser(req);
+        if (!user) return res.status(401).json({ error: "auth required" });
 
-    const { listingId } = req.body || {};
-    if (!listingId || typeof listingId !== "string" || listingId.length > 128) {
-        return res.status(400).json({ error: "listingId inválido" });
-    }
+        const { listingId } = req.body || {};
+        if (!listingId || typeof listingId !== "string" || listingId.length > 128) {
+            return res.status(400).json({ error: "listingId inválido" });
+        }
 
-    // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
-    // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    const listingRef = db.collection("listings").doc(listingId);
-    const listingSnap = await listingRef.get();
-    if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
-    const listing = listingSnap.data();
-    const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
-    if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
-        return res.status(403).json({ error: "anúncio não pertence ao usuário" });
-    }
-    if (listing.is_featured === true) {
-        return res.status(409).json({ error: "anúncio já é destaque" });
-    }
+        // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
+        // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
+        const listingRef = db.collection("listings").doc(listingId);
+        const listingSnap = await listingRef.get();
+        if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
+        const listing = listingSnap.data() || {};
+        const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
+        if (ownerEmail && ownerEmail !== String(user.email || "").toLowerCase()) {
+            return res.status(403).json({ error: "anúncio não pertence ao usuário" });
+        }
+        if (listing.is_featured === true) {
+            return res.status(409).json({ error: "anúncio já é destaque" });
+        }
 
-    const cents = await getFeaturedPriceCents();
+        const cents = await getFeaturedPriceCents();
+        const siteUrl = String(PUBLIC_SITE_URL || req.headers.origin || "https://lughworldcommunity.netlify.app").replace(/\/+$/, "");
 
-    const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
-        line_items: [{
-            price_data: {
-                currency: "brl",
-                product_data: {
-                    name: `Destaque Premium — Anúncio ${listingId}`,
-                    description: "Aura dourada + prioridade no topo da listagem"
+        const session = await stripe.checkout.sessions.create({
+            mode: "payment",
+            payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
+            line_items: [{
+                price_data: {
+                    currency: "brl",
+                    product_data: {
+                        name: `Destaque Premium — Anúncio ${listingId}`,
+                        description: "Aura dourada + prioridade no topo da listagem"
+                    },
+                    unit_amount: cents
                 },
-                unit_amount: cents
+                quantity: 1
+            }],
+            customer_email: user.email,
+            metadata: {
+                listingId,
+                userId: user.uid,
+                userEmail: user.email
             },
-            quantity: 1
-        }],
-        customer_email: user.email,
-        metadata: {
-            listingId,
-            userId: user.uid,
-            userEmail: user.email
-        },
-        success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
-        cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
-    });
+            success_url: `${siteUrl}/?premium=success&listing=${encodeURIComponent(listingId)}`,
+            cancel_url: `${siteUrl}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
+        });
 
-    res.json({ url: session.url, id: session.id });
+        return res.json({ url: session.url, id: session.id });
+    } catch (err) {
+        console.error("[checkout] erro:", err && err.message ? err.message : err);
+        const status = Number(err && (err.statusCode || err.status)) || 500;
+        return res.status(status >= 400 && status < 600 ? status : 500).json({
+            error: "checkout_failed",
+            message: err && err.message ? String(err.message) : "Erro ao iniciar pagamento"
+        });
+    }
 });
 
 // ===== Lógica do pagamento confirmado =====
