@@ -387,8 +387,51 @@ app.get("/api/auth/discord/callback", async (req, res) => {
         const safePayload = JSON.stringify({ type: ok ? "lugh-discord-linked" : "lugh-discord-link-error", ...payload }).replace(/</g, "\\u003c");
         const returnTo = payload && payload.returnTo ? String(payload.returnTo) : sanitizeDiscordReturnTo("");
         const safeReturnTo = JSON.stringify(returnTo).replace(/</g, "\\u003c");
+        const title = ok ? "Discord vinculado com sucesso!" : "Falha ao vincular Discord.";
+        const subtitle = ok ? "Voltando para o anúncio em alguns segundos..." : "Não foi possível concluir a vinculação.";
+        const icon = ok ? "✅" : "⚠️";
+        // Mantém a tela visível tempo suficiente para o usuário ler a confirmação.
+        const delay = ok ? 6500 : 6000;
         res.set("Content-Type", "text/html; charset=utf-8");
-        res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Discord</title></head><body style="font-family:Arial;background:#0b1024;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div>${ok ? "Discord vinculado. Voltando para o anúncio..." : "Falha ao vincular Discord."}</div><script>var sent=false;try{if(window.opener){window.opener.postMessage(${safePayload}, "*");sent=true;setTimeout(function(){window.close();},700);}}catch(e){} if(!sent){setTimeout(function(){window.location.href=${safeReturnTo};},500);}</script></body></html>`);
+        res.send(`<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Discord — Lugh World Community</title>
+<style>
+    :root{color-scheme:dark;}
+    *{box-sizing:border-box;}
+    body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#080d22;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:22px;overflow:hidden;}
+    body:before{content:"";position:fixed;inset:-20%;background:radial-gradient(circle at 50% 20%,rgba(88,101,242,.30),transparent 34%),radial-gradient(circle at 18% 85%,rgba(95,240,210,.12),transparent 28%),linear-gradient(180deg,#080d22,#030717);z-index:-2;}
+    body:after{content:"";position:fixed;inset:0;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:86px 86px;opacity:.18;z-index:-1;}
+    .card{width:min(92vw,430px);border:1px solid rgba(88,101,242,.58);border-radius:24px;padding:30px 22px 24px;text-align:center;background:radial-gradient(circle at 50% 0%,rgba(88,101,242,.34),transparent 44%),linear-gradient(180deg,rgba(22,24,63,.98),rgba(10,12,36,.98));box-shadow:0 24px 80px rgba(0,0,0,.50),0 0 36px rgba(88,101,242,.24);}
+    .icon{width:58px;height:58px;margin:0 auto 16px;display:flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid ${ok ? "rgba(46,213,115,.45)" : "rgba(255,86,100,.42)"};background:${ok ? "rgba(46,213,115,.17)" : "rgba(255,86,100,.14)"};box-shadow:0 0 30px ${ok ? "rgba(46,213,115,.28)" : "rgba(255,86,100,.22)"};font-size:1.65rem;animation:pulse 1.15s ease-in-out infinite;}
+    h1{font-size:1.1rem;margin:0 0 8px;font-weight:900;}
+    p{margin:0;color:rgba(255,255,255,.82);font-size:.92rem;line-height:1.4;}
+    .notice{margin:15px 0 13px;padding:11px 12px;border-radius:15px;border:1px solid rgba(88,101,242,.28);background:rgba(88,101,242,.10);color:rgba(255,255,255,.78);font-size:.82rem;line-height:1.35;}
+    .progress{height:9px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.12);}
+    .progress i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,rgba(88,101,242,.95),rgba(120,95,255,.95),rgba(95,240,210,.95));box-shadow:0 0 18px rgba(88,101,242,.38);animation:load ${Math.max(1.2, delay / 1000)}s ease forwards;}
+    @keyframes pulse{0%,100%{transform:scale(1);opacity:1;}50%{transform:scale(1.06);opacity:.88;}}
+    @keyframes load{from{width:12%;}to{width:100%;}}
+</style>
+</head>
+<body>
+    <main class="card" role="status" aria-live="polite">
+        <div class="icon" aria-hidden="true">${icon}</div>
+        <h1>${title}</h1>
+        <p>${subtitle}</p>
+        <div class="notice">${ok ? "💙 Conta conectada com segurança à comunidade. Você será redirecionado automaticamente." : "🔁 Aguarde alguns instantes e tente novamente."}</div>
+        <div class="progress" aria-hidden="true"><i></i></div>
+    </main>
+<script>
+var sent=false;
+var delay=${delay};
+try{if(window.opener){window.opener.postMessage(${safePayload}, "*");sent=true;setTimeout(function(){window.close();},delay);}}catch(e){}
+if(!sent){setTimeout(function(){window.location.href=${safeReturnTo};},delay);}
+</script>
+</body>
+</html>`);
     };
     if (oauthError === "access_denied" && state) {
         try {
