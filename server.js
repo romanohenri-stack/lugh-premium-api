@@ -32,7 +32,6 @@ const {
     DISCORD_CLIENT_ID,
     DISCORD_CLIENT_SECRET,
     DISCORD_REDIRECT_URI,
-    CRON_SECRET = "",
     STEAM_NEWS_AUTO_IMPORT_MINUTES = "30",
     PORT = 8787
 } = process.env;
@@ -512,7 +511,6 @@ let steamNewsImportRunning = false;
 const steamAnnouncementMediaCache = new Map();
 const steamTranslationCache = new Map();
 const STEAM_ANNOUNCEMENT_CACHE_MS = 6 * 60 * 60 * 1000;
-const STEAM_NEWS_FORMATTING_VERSION = 14;
 
 function escapeSteamHtml(value) {
     return String(value || "")
@@ -957,37 +955,13 @@ async function fetchSteamAnnouncementMedia(url) {
     }
 }
 
-function getSteamApiCoverFromItemServer(item) {
-    const source = item || {};
-    const candidates = [
-        source.steam_api_image_url,
-        source.api_image_url,
-        source.image_url,
-        source.imageUrl,
-        source.image,
-        source.thumbnail,
-        source.thumbnail_url,
-        source.header_image
-    ];
-    for (const candidate of candidates) {
-        const safe = safeSteamHttpUrl(candidate);
-        if (safe) return safe;
-    }
-    return "";
-}
-
 async function enrichSteamNewsItemServer(item) {
     if (!item) return item;
-    const steamApiImageUrl = getSteamApiCoverFromItemServer(item);
     try {
         const media = await fetchSteamAnnouncementMedia(item.url);
         return {
             ...item,
-            // Nunca sobrescrever a capa própria do item da API da Steam com
-            // localized_title_image global da página. A página pode listar várias
-            // notícias e repetir o primeiro banner em itens diferentes.
-            steam_api_image_url: steamApiImageUrl,
-            image_url: steamApiImageUrl || safeSteamHttpUrl(item.image_url) || "",
+            image_url: media.imageUrl || "",
             steam_title_image: media.titleImage || "",
             steam_capsule_image: media.capsuleImage || "",
             steam_published_at: media.publishedAt || "",
@@ -996,11 +970,7 @@ async function enrichSteamNewsItemServer(item) {
         };
     } catch (err) {
         console.warn("[steam-news] capa do anuncio indisponivel:", item.url, err.message);
-        return {
-            ...item,
-            steam_api_image_url: steamApiImageUrl,
-            image_url: steamApiImageUrl || safeSteamHttpUrl(item.image_url) || ""
-        };
+        return item;
     }
 }
 
@@ -1022,17 +992,17 @@ async function fetchSteamNewsPayload(appid, count = 10) {
 
 function getSteamExplicitCoverServer(item) {
     const source = item || {};
-    const apiCover = getSteamApiCoverFromItemServer(source);
-    if (apiCover) return apiCover;
-
     const candidates = [
-        // Fallbacks somente quando a API não entrega imagem própria.
-        // steam_title_image/capsule podem vir da página agregada da Steam, por
-        // isso ficam depois da imagem real do item para evitar banner repetido.
+        source.steam_title_image,
+        source.image_url,
+        source.imageUrl,
+        source.image,
+        source.thumbnail,
+        source.thumbnail_url,
         source.capsule_image,
         source.capsuleImage,
-        source.steam_capsule_image,
-        source.steam_title_image
+        source.header_image,
+        source.steam_capsule_image
     ];
     for (const candidate of candidates) {
         const safe = safeSteamHttpUrl(candidate);
@@ -1371,7 +1341,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: STEAM_NEWS_FORMATTING_VERSION,
+        formattingVersion: 9,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
@@ -1391,7 +1361,7 @@ async function importSteamNewsForGame(game) {
         const snap = await ref.get();
         if (snap.exists) {
             const existing = snap.data() || {};
-            if (Number(existing.formattingVersion || 0) < STEAM_NEWS_FORMATTING_VERSION
+            if (Number(existing.formattingVersion || 0) < 9
                 || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
                 const rebuilt = await buildSteamNewsRecordServer(game, item);
                 await ref.set({
@@ -1407,7 +1377,7 @@ async function importSteamNewsForGame(game) {
         if (!duplicate.empty) {
             const duplicateDoc = duplicate.docs[0];
             const existing = duplicateDoc.data() || {};
-            if (Number(existing.formattingVersion || 0) < STEAM_NEWS_FORMATTING_VERSION
+            if (Number(existing.formattingVersion || 0) < 9
                 || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
                 const rebuilt = await buildSteamNewsRecordServer(game, item);
                 await duplicateDoc.ref.set({
@@ -1511,50 +1481,6 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
         console.error("[steam-news-import] erro:", err);
         res.status(502).json({ error: "steam_import_failed" });
     }
-});
-
-// ===== Steam News Cron =====
-// Rota leve para cron-job.org: responde rápido e executa a importação em segundo plano.
-// Mantém o pagamento isolado: não altera /api/checkout nem /api/webhook.
-function isValidCronSecret(req) {
-    const expected = String(CRON_SECRET || "").trim();
-    if (!expected) return false;
-    const received = String(
-        (req.query && req.query.secret) ||
-        (req.headers && (req.headers["x-cron-secret"] || req.headers["x-lugh-cron-secret"])) ||
-        (req.body && req.body.secret) ||
-        ""
-    ).trim();
-    return received && received === expected;
-}
-
-function queueSteamNewsCronImport(trigger = "cron") {
-    setImmediate(async () => {
-        try {
-            const result = await runSteamNewsAutoImport();
-            console.log(`[steam-news] importacao ${trigger} finalizada:`, result);
-        } catch (err) {
-            console.error(`[steam-news] importacao ${trigger} falhou:`, err);
-        }
-    });
-}
-
-app.get("/api/cron/steam-news/import", (req, res) => {
-    if (!isValidCronSecret(req)) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    queueSteamNewsCronImport("cron");
-    res.set("Cache-Control", "no-store");
-    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
-});
-
-app.post("/api/cron/steam-news/import", (req, res) => {
-    if (!isValidCronSecret(req)) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    queueSteamNewsCronImport("cron");
-    res.set("Cache-Control", "no-store");
-    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
 });
 
 
