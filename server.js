@@ -1484,6 +1484,74 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
 });
 
 
+// ===== Steam News Cron Automático =====
+// Endpoint leve para cron-job.org chamar 1 vez por dia.
+// Protegido por CRON_SECRET no Render.
+// Importante: responde rápido para evitar timeout de 30s do cron-job.org.
+function getCronSecretFromRequest(req) {
+    const querySecret = req && req.query && req.query.secret ? String(req.query.secret) : "";
+    const headerSecret = req && req.headers && req.headers["x-cron-secret"] ? String(req.headers["x-cron-secret"]) : "";
+    return (querySecret || headerSecret).trim();
+}
+
+function isValidSteamCronRequest(req) {
+    const configuredSecret = String(process.env.CRON_SECRET || "").trim();
+    if (!configuredSecret) return false;
+    return getCronSecretFromRequest(req) === configuredSecret;
+}
+
+function queueSteamNewsCronImport() {
+    setTimeout(async () => {
+        try {
+            const result = await runSteamNewsAutoImport();
+            console.log("[steam-news-cron] finalizado:", result);
+        } catch (err) {
+            console.error("[steam-news-cron] erro:", err);
+        }
+    }, 0);
+}
+
+app.get("/api/cron/steam-news/import", (req, res) => {
+    if (!isValidSteamCronRequest(req)) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    if (steamNewsImportRunning) {
+        return res.json({
+            ok: true,
+            trigger: "cron",
+            queued: false,
+            skipped: true,
+            reason: "already_running",
+            mode: "light"
+        });
+    }
+
+    queueSteamNewsCronImport();
+    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
+});
+
+app.post("/api/cron/steam-news/import", (req, res) => {
+    if (!isValidSteamCronRequest(req)) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    if (steamNewsImportRunning) {
+        return res.json({
+            ok: true,
+            trigger: "cron",
+            queued: false,
+            skipped: true,
+            reason: "already_running",
+            mode: "light"
+        });
+    }
+
+    queueSteamNewsCronImport();
+    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
+});
+
+
 
 // ===== Healthcheck para aquecer Render antes do Stripe =====
 app.get("/api/health", (_req, res) => {
