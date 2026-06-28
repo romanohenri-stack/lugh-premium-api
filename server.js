@@ -740,7 +740,7 @@ async function findExistingSteamNewsDocServer(game, item, record) {
 function shouldRebuildSteamNewsServer(existing) {
     const contentPt = existing && (existing.contentPt || existing.content && existing.content.pt);
     const contentEn = existing && (existing.contentEn || existing.content && existing.content.en);
-    return Number(existing && existing.formattingVersion || 0) < 12
+    return Number(existing && existing.formattingVersion || 0) < 13
         || !steamTextLooksPortuguese(contentPt, contentEn);
 }
 
@@ -1130,17 +1130,16 @@ function extractSteamAnnouncementMedia(html, finalUrl, preferredDetailId = "") {
     const twitterImage = extractSteamMetaImage(source, "twitter:image");
     const linkedImage = extractSteamLinkImage(source);
     const imageBase = steamClanImageBase(ogImage, twitterImage, linkedImage);
-    // Primeiro tenta a imagem da noticia pelo gid real. Se a Steam usar outro
-    // formato de pagina, volta para a leitura antiga que já puxava o banner certo.
-    const titleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId)
-        || extractSteamLocalizedImageFile(decoded, "localized_title_image");
-    const capsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId)
-        || extractSteamLocalizedImageFile(decoded, "localized_capsule_image");
+    // Com GID conhecido, só aceita title/capsule do bloco dessa notícia.
+    // Não usa localized_title_image global como capa, pois a página da Steam
+    // pode conter cards de outras notícias e isso troca o banner entre posts.
+    const scopedTitleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId);
+    const scopedCapsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId);
+    const titleFile = scopedTitleFile || (!detailId ? extractSteamLocalizedImageFile(decoded, "localized_title_image") : "");
+    const capsuleFile = scopedCapsuleFile || (!detailId ? extractSteamLocalizedImageFile(decoded, "localized_capsule_image") : "");
     const titleImage = safeSteamHttpUrl(imageBase && titleFile ? imageBase + titleFile : "");
     const capsuleImage = safeSteamHttpUrl(imageBase && capsuleFile ? imageBase + capsuleFile : "")
-        || ogImage
-        || twitterImage
-        || linkedImage;
+        || (!detailId ? (ogImage || twitterImage || linkedImage) : "");
     return {
         titleImage,
         capsuleImage,
@@ -1223,9 +1222,20 @@ async function enrichSteamNewsItemServer(item) {
     if (!item) return item;
     try {
         const media = await fetchSteamAnnouncementMedia(item.url, item.gid || item.id);
+        const apiImage = firstSafeSteamUrlServer([
+            item.image_url,
+            item.imageUrl,
+            item.image,
+            item.thumbnail,
+            item.thumbnail_url
+        ]);
         return {
             ...item,
-            image_url: media.imageUrl || "",
+            // Mantém a imagem vinda da API do item como fonte principal.
+            // O fetch da página só complementa; ele não pode sobrescrever
+            // com banner global de outro post da Central de Notícias.
+            image_url: apiImage || media.titleImage || media.imageUrl || "",
+            steam_api_image_url: apiImage || "",
             steam_title_image: media.titleImage || "",
             steam_capsule_image: media.capsuleImage || "",
             steam_published_at: media.publishedAt || "",
@@ -1266,9 +1276,12 @@ function firstSafeSteamUrlServer(candidates) {
 function getSteamExplicitCoverServer(item) {
     const source = item || {};
     return firstSafeSteamUrlServer([
-        source.steam_title_image,
+        // Primeiro usa a capa que veio junto do item da API Steam.
+        // Ela pertence ao card correto da notícia e evita misturar banners.
+        source.steam_api_image_url,
         source.image_url,
         source.imageUrl,
+        source.steam_title_image,
         source.image,
         source.thumbnail,
         source.thumbnail_url,
@@ -1760,7 +1773,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 12,
+        formattingVersion: 13,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
