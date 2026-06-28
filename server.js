@@ -740,7 +740,7 @@ async function findExistingSteamNewsDocServer(game, item, record) {
 function shouldRebuildSteamNewsServer(existing) {
     const contentPt = existing && (existing.contentPt || existing.content && existing.content.pt);
     const contentEn = existing && (existing.contentEn || existing.content && existing.content.en);
-    return Number(existing && existing.formattingVersion || 0) < 10
+    return Number(existing && existing.formattingVersion || 0) < 11
         || !steamTextLooksPortuguese(contentPt, contentEn);
 }
 
@@ -1000,14 +1000,24 @@ function decodeSteamJsonString(value) {
     }
 }
 
-function getSteamAnnouncementDetailId(url) {
+function getSteamAnnouncementDetailId(url, fallbackId = "") {
     const safe = safeSteamHttpUrl(url);
-    const match = safe && safe.match(/\/announcements\/detail\/(\d+)/i);
-    return match ? match[1] : "";
+    const patterns = [
+        /\/announcements\/detail\/(\d+)/i,
+        /\/news\/app\/\d+\/view\/(\d+)/i,
+        /\/news\/app\/\d+\/detail\/(\d+)/i,
+        /[?&](?:gid|newsid|event_gid)=(\d+)/i
+    ];
+    for (const pattern of patterns) {
+        const match = safe && safe.match(pattern);
+        if (match && match[1]) return match[1];
+    }
+    const fallbackMatch = String(fallbackId || "").match(/\d{6,}/);
+    return fallbackMatch ? fallbackMatch[0] : "";
 }
 
-function extractSteamAnnouncementLocalization(html, finalUrl) {
-    const detailId = getSteamAnnouncementDetailId(finalUrl);
+function extractSteamAnnouncementLocalization(html, finalUrl, preferredDetailId = "") {
+    const detailId = getSteamAnnouncementDetailId(finalUrl, preferredDetailId);
     if (!detailId) return { title: "", content: "" };
     const source = decodeSteamHtmlEntities(html);
     const escapedId = detailId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1112,18 +1122,20 @@ function steamClanImageBase(...urls) {
     return "";
 }
 
-function extractSteamAnnouncementMedia(html, finalUrl) {
+function extractSteamAnnouncementMedia(html, finalUrl, preferredDetailId = "") {
     const source = String(html || "");
     const decoded = decodeSteamAnnouncementMarkup(source);
-    const detailId = getSteamAnnouncementDetailId(finalUrl);
+    const detailId = getSteamAnnouncementDetailId(finalUrl, preferredDetailId);
     const ogImage = extractSteamMetaImage(source, "og:image");
     const twitterImage = extractSteamMetaImage(source, "twitter:image");
     const linkedImage = extractSteamLinkImage(source);
     const imageBase = steamClanImageBase(ogImage, twitterImage, linkedImage);
-    // Importante: Steam pode colocar varias noticias no mesmo HTML.
-    // Nunca usar localized_title_image da pagina inteira; precisa pertencer ao gid atual.
-    const titleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId);
-    const capsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId);
+    // Primeiro tenta a imagem da noticia pelo gid real. Se a Steam usar outro
+    // formato de pagina, volta para a leitura antiga que já puxava o banner certo.
+    const titleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId)
+        || extractSteamLocalizedImageFile(decoded, "localized_title_image");
+    const capsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId)
+        || extractSteamLocalizedImageFile(decoded, "localized_capsule_image");
     const titleImage = safeSteamHttpUrl(imageBase && titleFile ? imageBase + titleFile : "");
     const capsuleImage = safeSteamHttpUrl(imageBase && capsuleFile ? imageBase + capsuleFile : "")
         || ogImage
@@ -1132,9 +1144,7 @@ function extractSteamAnnouncementMedia(html, finalUrl) {
     return {
         titleImage,
         capsuleImage,
-        // imageUrl fica reservado para capa exclusiva da noticia.
-        // capsule/og sao genericos em alguns anuncios e podem repetir o mesmo banner.
-        imageUrl: titleImage || "",
+        imageUrl: titleImage || capsuleImage,
         resolvedUrl: safeSteamHttpUrl(finalUrl),
         publishedAt: extractSteamMetaContent(source, "article:published_time")
     };
@@ -1155,7 +1165,7 @@ function isAllowedSteamAnnouncementUrl(value) {
     }
 }
 
-async function fetchSteamAnnouncementMedia(url) {
+async function fetchSteamAnnouncementMedia(url, preferredDetailId = "") {
     const safeUrl = safeSteamHttpUrl(url);
     if (!isAllowedSteamAnnouncementUrl(safeUrl)) return { titleImage: "", capsuleImage: "", imageUrl: "", resolvedUrl: safeUrl };
     const cached = steamAnnouncementMediaCache.get(safeUrl);
@@ -1194,10 +1204,10 @@ async function fetchSteamAnnouncementMedia(url) {
     if (!primaryPage) throw (ptResult.reason || enResult.reason || new Error("steam_announcement_unavailable"));
 
     try {
-        const media = extractSteamAnnouncementMedia(primaryPage.html, withoutSteamLanguage(primaryPage.url));
+        const media = extractSteamAnnouncementMedia(primaryPage.html, withoutSteamLanguage(primaryPage.url), preferredDetailId);
         media.localized = {
-            pt: ptPage ? extractSteamAnnouncementLocalization(ptPage.html, ptPage.url) : { title: "", content: "" },
-            en: enPage ? extractSteamAnnouncementLocalization(enPage.html, enPage.url) : { title: "", content: "" }
+            pt: ptPage ? extractSteamAnnouncementLocalization(ptPage.html, ptPage.url, preferredDetailId) : { title: "", content: "" },
+            en: enPage ? extractSteamAnnouncementLocalization(enPage.html, enPage.url, preferredDetailId) : { title: "", content: "" }
         };
         steamAnnouncementMediaCache.set(safeUrl, { savedAt: Date.now(), media });
         if (media.resolvedUrl && media.resolvedUrl !== safeUrl) {
@@ -1212,7 +1222,7 @@ async function fetchSteamAnnouncementMedia(url) {
 async function enrichSteamNewsItemServer(item) {
     if (!item) return item;
     try {
-        const media = await fetchSteamAnnouncementMedia(item.url);
+        const media = await fetchSteamAnnouncementMedia(item.url, item.gid || item.id);
         return {
             ...item,
             image_url: media.imageUrl || "",
@@ -1254,13 +1264,17 @@ function firstSafeSteamUrlServer(candidates) {
 
 function getSteamExplicitCoverServer(item) {
     const source = item || {};
-    // Somente imagens exclusivas do anuncio. Nao usar capsule/og aqui,
-    // pois sao imagens genericas que podem repetir em varias noticias.
     return firstSafeSteamUrlServer([
         source.steam_title_image,
-        source.titleImage,
-        source.localized_title_image,
-        source.title_image
+        source.image_url,
+        source.imageUrl,
+        source.image,
+        source.thumbnail,
+        source.thumbnail_url,
+        source.capsule_image,
+        source.capsuleImage,
+        source.header_image,
+        source.steam_capsule_image
     ]);
 }
 
@@ -1687,23 +1701,12 @@ async function buildSteamNewsRecordServer(game, item) {
             : "english-fallback";
     }
     const contentImages = extractSteamImagesServer(`${htmlEn}${htmlPt}`);
-    const coverImage = getSteamBestCoverServer(item, contentImages);
-    const images = [];
-    const addSteamImage = (img, cover, order) => {
-        const url = safeSteamHttpUrl(img && img.url || img);
-        if (!url) return;
-        const comparable = comparableSteamImageUrlServer(url);
-        if (images.some(existing => comparableSteamImageUrlServer(existing.url) === comparable)) return;
-        images.push({
-            url,
-            alt: String(img && img.alt || (cover ? (titlePt || titleEn) : "")).trim(),
-            caption: String(img && img.caption || "").trim(),
-            cover: !!cover,
-            order
-        });
-    };
-    if (coverImage) addSteamImage({ url: coverImage, alt: titlePt || titleEn }, true, -1);
-    contentImages.forEach((img, index) => addSteamImage(img, false, index));
+    const explicitCover = getSteamExplicitCoverServer(item);
+    const coverImage = explicitCover;
+    const images = contentImages.map(img => ({ ...img, cover: false }));
+    if (explicitCover) {
+        images.unshift({ url: explicitCover, alt: titlePt || titleEn, caption: "", cover: true, order: -1 });
+    }
     const bodyHtmlEn = coverImage ? removeSteamCoverFromBodyServer(htmlEn, coverImage) : htmlEn;
     const bodyHtmlPt = coverImage ? removeSteamCoverFromBodyServer(htmlPt, coverImage) : htmlPt;
     const summaryEn = steamSummaryFromHtmlServer(bodyHtmlEn);
@@ -1756,7 +1759,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 10,
+        formattingVersion: 11,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
@@ -1848,7 +1851,7 @@ app.get("/api/steam-announcement-cover", async (req, res) => {
     }
 
     try {
-        const media = await fetchSteamAnnouncementMedia(url);
+        const media = await fetchSteamAnnouncementMedia(url, req.query.gid || req.query.id || "");
         res.set("Cache-Control", "public, max-age=21600");
         res.json(media);
     } catch (err) {
