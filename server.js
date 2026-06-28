@@ -275,7 +275,9 @@ async function fetchDiscordTokenWithRetry(body) {
             lastError = err;
             console.error("[discord-token] erro:", response.status, String(errorCode), compactBody);
 
-            if (attempt < 2 && (response.status >= 500 || response.status === 429 || isCloudflareHtml)) {
+            // Nao repetir quando o Discord/Cloudflare retornar 429.
+            // Cada retry conta como nova tentativa e pode prolongar o bloqueio.
+            if (attempt < 2 && response.status !== 429 && (response.status >= 500 || isCloudflareHtml)) {
                 await waitDiscordRetry(900);
                 continue;
             }
@@ -438,7 +440,8 @@ app.get("/api/auth/discord/callback", async (req, res) => {
         sendHtml(true, { discord: discordPublicPayload(profile), returnTo: stateData.returnTo });
     } catch (err) {
         console.error("[discord-oauth] erro:", err);
-        sendHtml(false, { error: err.message || "discord_link_failed", returnTo: withDiscordReturnStatus(stateData && stateData.returnTo, "error") });
+        const discordStatus = err && err.status === 429 ? "rate_limited" : "error";
+        sendHtml(false, { error: err.message || "discord_link_failed", returnTo: withDiscordReturnStatus(stateData && stateData.returnTo, discordStatus) });
     }
 });
 
