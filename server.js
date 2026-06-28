@@ -21,6 +21,7 @@ const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 // ===== ENV =====
 const {
@@ -28,11 +29,13 @@ const {
     STRIPE_WEBHOOK_SECRET,
     FIREBASE_SERVICE_ACCOUNT_JSON, // string JSON da service account
     PUBLIC_SITE_URL = "http://localhost:5173",
+    PUBLIC_API_URL = "",
     ADMIN_EMAILS = "romanohenri@gmail.com",
-    DISCORD_CLIENT_ID,
-    DISCORD_CLIENT_SECRET,
-    DISCORD_REDIRECT_URI,
-    STEAM_NEWS_AUTO_IMPORT_MINUTES = "30",
+    DISCORD_CLIENT_ID = "",
+    DISCORD_CLIENT_SECRET = "",
+    DISCORD_REDIRECT_URI = "",
+    STEAM_NEWS_AUTO_IMPORT_MINUTES = "1440",
+    CRON_SECRET = "",
     PORT = 8787
 } = process.env;
 
@@ -48,35 +51,7 @@ const ADMINS = ADMIN_EMAILS.split(",").map(s => s.trim().toLowerCase());
 
 // ===== APP =====
 const app = express();
-
-// CORS liberado para o site Netlify, localhost e previews.
-// Necessário porque o frontend chama este backend com Authorization: Bearer <FirebaseToken>.
-const allowedOrigins = [
-    "https://lughworldcommunity.netlify.app",
-    "https://www.lughworldcommunity.netlify.app",
-    "http://localhost:8080",
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:8080",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000"
-];
-
-const corsOptions = {
-    origin(origin, callback) {
-        // Permite ferramentas sem Origin, localhost e qualquer preview/deploy Netlify.
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.includes(origin)) return callback(null, true);
-        if (/^https:\/\/.*\.netlify\.app$/.test(origin)) return callback(null, true);
-        return callback(null, true); // fallback aberto para evitar bloqueio durante testes
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false
-};
-
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.use(cors({ origin: true, credentials: true }));
 
 // IMPORTANTE: a rota de webhook precisa do body RAW. Ela é declarada ANTES
 // do express.json() para que o middleware JSON não consuma o stream.
@@ -116,12 +91,21 @@ app.post("/api/webhook",
 // JSON para o restante das rotas
 app.use(express.json({ limit: "200kb" }));
 
+// ===== Healthcheck / Warmup Render =====
+// Rota leve usada pelo frontend para acordar o backend antes do Checkout Premium.
+app.get("/api/health", (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ ok: true, service: "lugh-premium-api", ts: Date.now() });
+});
+
 // ===== Helpers de autenticação =====
 // Verifica o ID Token do Firebase enviado pelo frontend no header Authorization.
 async function getUser(req) {
     const h = req.headers.authorization || "";
     const m = h.match(/^Bearer (.+)$/);
-    const token = m ? m[1] : (req.query && req.query.token ? String(req.query.token) : "");
+    const token = (m && m[1])
+        || (req.query && typeof req.query.token === "string" ? req.query.token : "")
+        || (req.body && typeof req.body.token === "string" ? req.body.token : "");
     if (!token) return null;
     try {
         const decoded = await admin.auth().verifyIdToken(token);
@@ -132,121 +116,209 @@ function isAdmin(user) {
     return user && user.email && ADMINS.includes(user.email.toLowerCase());
 }
 
-// ===== Discord OAuth =====
-// Vincula uma conta Discord ao usuário Firebase logado.
-// Fluxo esperado no frontend:
-// 1) obter idToken do Firebase: currentUser.getIdToken()
-// 2) abrir: `${API_BASE}/api/auth/discord/start?token=${encodeURIComponent(idToken)}`
-// 3) callback salva users/{uid} com discordId/username/avatar e volta ao site.
-function getDiscordRedirectUri() {
-    return DISCORD_REDIRECT_URI || `${PUBLIC_SITE_URL.replace(/\/+$/, "")}/api/auth/discord/callback`;
+function getCronSecret(req) {
+    return String(
+        req.headers["x-cron-secret"]
+        || req.headers.authorization && req.headers.authorization.replace(/^Bearer\s+/i, "")
+        || req.query && req.query.secret
+        || req.body && req.body.secret
+        || ""
+    ).trim();
 }
 
-function getPublicSiteUrl() {
-    return String(PUBLIC_SITE_URL || "http://localhost:5173").replace(/\/+$/, "");
+function isValidCronSecret(req) {
+    const expected = String(CRON_SECRET || "").trim();
+    const received = getCronSecret(req);
+    if (!expected || !received) return false;
+    const expectedBuffer = Buffer.from(expected);
+    const receivedBuffer = Buffer.from(received);
+    return expectedBuffer.length === receivedBuffer.length
+        && crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
 }
 
-function buildDiscordAvatarUrl(discordUser) {
-    if (!discordUser || !discordUser.id || !discordUser.avatar) return "";
-    const ext = String(discordUser.avatar).startsWith("a_") ? "gif" : "png";
-    return `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.${ext}?size=128`;
+
+// ===== Discord OAuth (vincular Discord ao usuário Firebase) =====
+// Uso no Mercado/Fórum: o usuário vincula uma vez; o frontend copia os dados
+// para o anúncio/post. Não consulta o Discord em cada renderização.
+const DISCORD_STATE_COLLECTION = "discord_oauth_states";
+const USERS_COLLECTION = "users";
+
+function getBaseApiUrl(req) {
+    return String(PUBLIC_API_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
 }
 
-function encodeDiscordState(payload) {
-    return Buffer.from(JSON.stringify(payload)).toString("base64url");
+function getDiscordRedirectUri(req) {
+    return DISCORD_REDIRECT_URI || `${getBaseApiUrl(req)}/api/auth/discord/callback`;
 }
 
-function decodeDiscordState(value) {
-    return JSON.parse(Buffer.from(String(value || ""), "base64url").toString("utf8"));
+function sanitizeDiscordReturnTo(value, options = {}) {
+    const fallback = String(PUBLIC_SITE_URL || "http://localhost:5173").replace(/\/+$/, "");
+    const raw = String(value || "").trim();
+    const status = String(options.discord || "linked").trim() || "linked";
+    const safeDefault = () => `${fallback}/?tab=market&open=createListing&discord=${encodeURIComponent(status)}`;
+
+    let target;
+    let tab = String(options.tab || "").trim();
+    let open = String(options.open || "").trim();
+
+    try {
+        if (/^(createListing|market-create-listing)$/i.test(raw)) {
+            target = new URL(fallback);
+            tab = "market";
+            open = "createListing";
+        } else if (/^(createGuide|forum-create-guide)$/i.test(raw)) {
+            target = new URL(fallback);
+            tab = "forum";
+            open = "createGuide";
+        } else if (raw) {
+            target = new URL(raw, fallback);
+            const allowed = new URL(fallback);
+            if (target.origin !== allowed.origin) return safeDefault();
+            tab = tab || target.searchParams.get("tab") || "";
+            open = open || target.searchParams.get("open") || "";
+        } else {
+            target = new URL(fallback);
+        }
+
+        if (!tab && /forum/i.test(open)) tab = "forum";
+        if (!tab) tab = "market";
+        if (!open) open = tab === "forum" ? "createGuide" : "createListing";
+
+        target.searchParams.set("tab", tab);
+        target.searchParams.set("open", open);
+        target.searchParams.set("discord", status);
+        return target.toString();
+    } catch (_) {
+        return safeDefault();
+    }
 }
 
-function buildDiscordReturnUrl(status, state = {}) {
-    const redirectUrl = new URL(getPublicSiteUrl());
-    const returnTo = String(state.returnTo || "").trim();
-    const tab = String(state.tab || "").trim();
-    const open = String(state.open || "").trim();
+function withDiscordReturnStatus(returnTo, status) {
+    try {
+        const url = new URL(returnTo || sanitizeDiscordReturnTo(""));
+        url.searchParams.set("discord", status || "linked");
+        return url.toString();
+    } catch (_) {
+        return sanitizeDiscordReturnTo("", { discord: status || "linked" });
+    }
+}
 
-    if (returnTo === "createListing" || returnTo === "market-create-listing" || open === "createListing") {
-        redirectUrl.searchParams.set("tab", "market");
-        redirectUrl.searchParams.set("open", "createListing");
-    } else {
-        if (tab) redirectUrl.searchParams.set("tab", tab);
-        if (open) redirectUrl.searchParams.set("open", open);
+function discordAvatarUrl(user) {
+    if (!user || !user.id || !user.avatar) return "";
+    const ext = String(user.avatar).startsWith("a_") ? "gif" : "png";
+    return `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.${ext}?size=128`;
+}
+
+function discordPublicPayload(data) {
+    if (!data || !data.discordId) return null;
+    return {
+        discordId: data.discordId,
+        discordUsername: data.discordUsername || "",
+        discordGlobalName: data.discordGlobalName || "",
+        discordAvatar: data.discordAvatar || "",
+        discordLinkedAt: data.discordLinkedAt || null
+    };
+}
+
+app.post("/api/auth/discord/start", async (req, res) => {
+    const user = await getUser(req);
+    if (!user) return res.status(401).json({ error: "auth required" });
+    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+        return res.status(500).json({ error: "discord_env_missing" });
     }
 
-    redirectUrl.searchParams.set("discord", status);
-    return redirectUrl.toString();
-}
+    const state = crypto.randomBytes(24).toString("hex");
+    const redirectUri = getDiscordRedirectUri(req);
+    const returnTo = sanitizeDiscordReturnTo((req.body && req.body.returnTo) || (req.query && req.query.returnTo), {
+        tab: (req.body && req.body.tab) || (req.query && req.query.tab),
+        open: (req.body && req.body.open) || (req.query && req.query.open)
+    });
+    await db.collection(DISCORD_STATE_COLLECTION).doc(state).set({
+        uid: user.uid,
+        email: user.email || null,
+        returnTo,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        expires_at_ms: Date.now() + 10 * 60 * 1000
+    });
+
+    const params = new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        scope: "identify",
+        state,
+        prompt: "consent"
+    });
+    res.json({ url: `https://discord.com/oauth2/authorize?${params.toString()}` });
+});
+
 
 app.get("/api/auth/discord/start", async (req, res) => {
-    try {
-        const user = await getUser(req);
-        if (!user) {
-            return res.status(401).send("Login Firebase necessario antes de vincular Discord.");
-        }
-
-        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
-            return res.status(500).send("Discord OAuth nao configurado no servidor.");
-        }
-
-        const state = encodeDiscordState({
-            uid: user.uid,
-            email: user.email || "",
-            t: Date.now(),
-            returnTo: String(req.query.returnTo || "").slice(0, 80),
-            tab: String(req.query.tab || "").slice(0, 40),
-            open: String(req.query.open || "").slice(0, 80)
-        });
-
-        const params = new URLSearchParams({
-            client_id: DISCORD_CLIENT_ID,
-            redirect_uri: getDiscordRedirectUri(),
-            response_type: "code",
-            scope: "identify email",
-            state
-        });
-
-        res.redirect(`https://discord.com/oauth2/authorize?${params.toString()}`);
-    } catch (err) {
-        console.error("[discord-start] erro:", err);
-        res.status(500).send("Erro ao iniciar vinculacao Discord.");
+    const user = await getUser(req);
+    if (!user) return res.status(401).send("Login Firebase necessário antes de vincular Discord.");
+    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
+        return res.status(500).send("Discord OAuth não configurado no servidor.");
     }
+
+    const state = crypto.randomBytes(24).toString("hex");
+    const redirectUri = getDiscordRedirectUri(req);
+    const returnTo = sanitizeDiscordReturnTo(req.query && req.query.returnTo, {
+        tab: req.query && req.query.tab,
+        open: req.query && req.query.open
+    });
+    await db.collection(DISCORD_STATE_COLLECTION).doc(state).set({
+        uid: user.uid,
+        email: user.email || null,
+        returnTo,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        expires_at_ms: Date.now() + 10 * 60 * 1000
+    });
+
+    const params = new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        scope: "identify",
+        state,
+        prompt: "consent"
+    });
+    res.redirect(`https://discord.com/oauth2/authorize?${params.toString()}`);
 });
 
 app.get("/api/auth/discord/callback", async (req, res) => {
+    const code = String(req.query.code || "").trim();
+    const state = String(req.query.state || "").trim();
+    const oauthError = String(req.query.error || "").trim();
+    const sendHtml = (ok, payload) => {
+        const safePayload = JSON.stringify({ type: ok ? "lugh-discord-linked" : "lugh-discord-link-error", ...payload }).replace(/</g, "\\u003c");
+        const returnTo = payload && payload.returnTo ? String(payload.returnTo) : sanitizeDiscordReturnTo("");
+        const safeReturnTo = JSON.stringify(returnTo).replace(/</g, "\\u003c");
+        res.set("Content-Type", "text/html; charset=utf-8");
+        res.send(`<!doctype html><html><head><meta charset="utf-8"><title>Discord</title></head><body style="font-family:Arial;background:#0b1024;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;"><div>${ok ? "Discord vinculado. Voltando para o anúncio..." : "Falha ao vincular Discord."}</div><script>var sent=false;try{if(window.opener){window.opener.postMessage(${safePayload}, "*");sent=true;setTimeout(function(){window.close();},700);}}catch(e){} if(!sent){setTimeout(function(){window.location.href=${safeReturnTo};},500);}</script></body></html>`);
+    };
+    if (oauthError === "access_denied" && state) {
+        try {
+            const cancelSnap = await db.collection(DISCORD_STATE_COLLECTION).doc(state).get();
+            const cancelData = cancelSnap.exists ? (cancelSnap.data() || {}) : {};
+            const cancelTo = cancelData.returnTo || sanitizeDiscordReturnTo("", { discord: "cancelled" });
+            return res.redirect(withDiscordReturnStatus(cancelTo, "cancelled"));
+        } catch (_) {}
+    }
+
+    if (!code || !state) return sendHtml(false, { error: "missing_code_or_state" });
+
+    const stateRef = db.collection(DISCORD_STATE_COLLECTION).doc(state);
+    const stateSnap = await stateRef.get();
+    if (!stateSnap.exists) return sendHtml(false, { error: "invalid_state" });
+    const stateData = stateSnap.data() || {};
+    if (!stateData.uid || Number(stateData.expires_at_ms || 0) < Date.now()) {
+        await stateRef.delete().catch(() => {});
+        return sendHtml(false, { error: "expired_state", returnTo: withDiscordReturnStatus(stateData.returnTo, "expired") });
+    }
+
     try {
-        const code = String(req.query.code || "");
-        const stateRaw = String(req.query.state || "");
-        const discordError = String(req.query.error || "");
-
-        let state = {};
-        if (stateRaw) {
-            try {
-                state = decodeDiscordState(stateRaw);
-            } catch (_) {
-                state = {};
-            }
-        }
-
-        // Quando o usuario clica em "Cancelar" no Discord, o OAuth volta com
-        // error=access_denied. Nao deve cair em pagina branca; retorna ao fluxo.
-        if (discordError) {
-            return res.redirect(buildDiscordReturnUrl("cancelled", state));
-        }
-
-        if (!code || !stateRaw) {
-            return res.status(400).send("Callback Discord invalido.");
-        }
-
-        if (!state.uid || Date.now() - Number(state.t || 0) > 10 * 60 * 1000) {
-            return res.redirect(buildDiscordReturnUrl("expired", state));
-        }
-
-        if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET) {
-            return res.status(500).send("Discord OAuth nao configurado no servidor.");
-        }
-
-        const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+        const redirectUri = getDiscordRedirectUri(req);
+        const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({
@@ -254,70 +326,43 @@ app.get("/api/auth/discord/callback", async (req, res) => {
                 client_secret: DISCORD_CLIENT_SECRET,
                 grant_type: "authorization_code",
                 code,
-                redirect_uri: getDiscordRedirectUri()
+                redirect_uri: redirectUri
             })
         });
+        const tokenData = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenData.access_token) throw new Error(tokenData.error || "discord_token_failed");
 
-        if (!tokenResponse.ok) {
-            const body = await tokenResponse.text();
-            console.error("[discord-token] erro:", tokenResponse.status, body);
-            return res.status(502).send("Erro ao autorizar Discord.");
-        }
-
-        const tokenData = await tokenResponse.json();
-
-        const meResponse = await fetch("https://discord.com/api/users/@me", {
+        const userRes = await fetch("https://discord.com/api/users/@me", {
             headers: { Authorization: `Bearer ${tokenData.access_token}` }
         });
+        const discordUser = await userRes.json().catch(() => ({}));
+        if (!userRes.ok || !discordUser.id) throw new Error(discordUser.message || "discord_user_failed");
 
-        if (!meResponse.ok) {
-            const body = await meResponse.text();
-            console.error("[discord-me] erro:", meResponse.status, body);
-            return res.status(502).send("Erro ao buscar perfil Discord.");
-        }
-
-        const discordUser = await meResponse.json();
-        const username = String(discordUser.global_name || discordUser.username || "").trim();
-        const tag = discordUser.discriminator && discordUser.discriminator !== "0"
-            ? `${discordUser.username}#${discordUser.discriminator}`
-            : String(discordUser.username || "").trim();
-
-        await db.collection("users").doc(state.uid).set({
-            uid: state.uid,
-            email: state.email || null,
-            discordId: String(discordUser.id || ""),
-            discordUsername: username,
-            discordTag: tag,
-            discordAvatar: buildDiscordAvatarUrl(discordUser),
-            discordEmail: discordUser.email || null,
-            discordLinked: true,
-            discordLinkedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        res.redirect(buildDiscordReturnUrl("linked", state));
+        const profile = {
+            discordId: String(discordUser.id),
+            discordUsername: String(discordUser.username || ""),
+            discordGlobalName: String(discordUser.global_name || ""),
+            discordAvatar: discordAvatarUrl(discordUser),
+            discordLinkedAt: Date.now(),
+            updated_at: admin.firestore.FieldValue.serverTimestamp(),
+            email: stateData.email || null
+        };
+        await db.collection(USERS_COLLECTION).doc(stateData.uid).set(profile, { merge: true });
+        await stateRef.delete().catch(() => {});
+        sendHtml(true, { discord: discordPublicPayload(profile), returnTo: stateData.returnTo });
     } catch (err) {
-        console.error("[discord-callback] erro:", err);
-        res.status(500).send("Erro interno ao vincular Discord.");
+        console.error("[discord-oauth] erro:", err);
+        sendHtml(false, { error: err.message || "discord_link_failed", returnTo: withDiscordReturnStatus(stateData && stateData.returnTo, "error") });
     }
 });
 
-// Consulta leve do perfil Discord vinculado do usuário logado.
-// Usar no modal de criar anúncio para mostrar "Discord vinculado".
 app.get("/api/me/discord", async (req, res) => {
     const user = await getUser(req);
     if (!user) return res.status(401).json({ error: "auth required" });
-
-    const snap = await db.collection("users").doc(user.uid).get();
-    const data = snap.exists ? snap.data() : {};
-    res.json({
-        linked: !!(data && data.discordLinked && data.discordId),
-        discordId: data && data.discordId || "",
-        discordUsername: data && data.discordUsername || "",
-        discordTag: data && data.discordTag || "",
-        discordAvatar: data && data.discordAvatar || ""
-    });
+    const snap = await db.collection(USERS_COLLECTION).doc(user.uid).get();
+    const profile = snap.exists ? discordPublicPayload(snap.data()) : null;
+    res.json({ discord: profile });
 });
-
 
 // ===== Settings (preço do destaque) =====
 const SETTINGS_DOC = db.collection("settings").doc("market_premium");
@@ -355,7 +400,6 @@ app.post("/api/admin/settings/featured-price", async (req, res) => {
 // ===== Checkout =====
 // O frontend chama isso ao marcar "Destaque Premium" no card.
 app.post("/api/checkout", async (req, res) => {
-    try {
     const user = await getUser(req);
     if (!user) return res.status(401).json({ error: "auth required" });
 
@@ -366,19 +410,9 @@ app.post("/api/checkout", async (req, res) => {
 
     // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
     // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    let listingCollection = "market_listings";
-let listingRef = db.collection(listingCollection).doc(listingId);
-let listingSnap = await listingRef.get();
-
-if (!listingSnap.exists) {
-    listingCollection = "listings";
-    listingRef = db.collection(listingCollection).doc(listingId);
-    listingSnap = await listingRef.get();
-}
-
-if (!listingSnap.exists) {
-    return res.status(404).json({ error: "anúncio não encontrado" });
-}
+    const listingRef = db.collection("listings").doc(listingId);
+    const listingSnap = await listingRef.get();
+    if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
     const listing = listingSnap.data();
     const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
     if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
@@ -390,38 +424,31 @@ if (!listingSnap.exists) {
 
     const cents = await getFeaturedPriceCents();
 
-const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    payment_method_types: ["card"],
-    line_items: [{
-        price_data: {
-            currency: "brl",
-            product_data: {
-                name: `Destaque Premium — Anúncio ${listingId}`,
-                description: "Aura dourada + prioridade no topo da listagem"
+    const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
+        line_items: [{
+            price_data: {
+                currency: "brl",
+                product_data: {
+                    name: `Destaque Premium — Anúncio ${listingId}`,
+                    description: "Aura dourada + prioridade no topo da listagem"
+                },
+                unit_amount: cents
             },
-            unit_amount: cents
+            quantity: 1
+        }],
+        customer_email: user.email,
+        metadata: {
+            listingId,
+            userId: user.uid,
+            userEmail: user.email
         },
-        quantity: 1
-    }],
-    customer_email: user.email,
-
-    metadata: {
-        listingId,
-        listingCollection,
-        userId: user.uid,
-        userEmail: user.email
-    },
-
-    success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
-    cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
+        success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
+        cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
     });
 
     res.json({ url: session.url, id: session.id });
-    } catch (err) {
-        console.error("[checkout] erro:", err);
-        res.status(500).json({ error: err && err.message ? err.message : "checkout error" });
-    }
 });
 
 // ===== Lógica do pagamento confirmado =====
@@ -436,33 +463,34 @@ async function handlePaidSession(session) {
 
     const batch = db.batch();
     // 1) marca o anúncio como destaque
-    const listingCollection = meta.listingCollection || "market_listings";
-const listingRef = db.collection(listingCollection).doc(listingId);
-    const now = admin.firestore.Timestamp.now();
-const premiumExpiresAtMs = now.toMillis() + 7 * 24 * 60 * 60 * 1000;
+    const listingRef = db.collection("listings").doc(listingId);
+    batch.set(listingRef, {
+        is_featured: true,
+        featured_at: admin.firestore.FieldValue.serverTimestamp(),
+        featured_session_id: session.id,
 
-batch.set(listingRef, {
-    is_featured: true,
-    featured_at: now,
-    featured_session_id: session.id,
-    premium_expires_at_ms: premiumExpiresAtMs,
-    expires_at_ms: premiumExpiresAtMs
-}, { merge: true });
+        // Validade do anúncio Premium:
+        // a partir da aprovação do pagamento, o anúncio ganha 7 dias completos.
+        // O frontend usa "date" para expiração automática, então resetamos para agora.
+        date: Date.now(),
+        premium_paid_at_ms: Date.now(),
+        premium_expires_at_ms: Date.now() + (7 * 24 * 60 * 60 * 1000),
+        expires_at_ms: Date.now() + (7 * 24 * 60 * 60 * 1000)
+    }, { merge: true });
 
     // 2) grava log de transação
-const logRef = db.collection("purchase_logs").doc(session.id);
-batch.set(logRef, {
-    session_id: session.id,
-    listing_id: listingId,
-    user_id: meta.userId || null,
-    email: meta.userEmail || session.customer_email || null,
-    amount_cents: session.amount_total,
-    currency: session.currency,
-    payment_method: paymentMethod,
-    status: session.payment_status,
-    premium_expires_at_ms: premiumExpiresAtMs,
-    created_at: admin.firestore.FieldValue.serverTimestamp()
-});
+    const logRef = db.collection("purchase_logs").doc(session.id);
+    batch.set(logRef, {
+        session_id: session.id,
+        listing_id: listingId,
+        user_id: meta.userId || null,
+        email: meta.userEmail || session.customer_email || null,
+        amount_cents: session.amount_total,
+        currency: session.currency,
+        payment_method: paymentMethod,
+        status: session.payment_status,
+        created_at: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     await batch.commit();
     console.log("[webhook] anúncio destacado + log gravado:", listingId, session.id);
@@ -471,19 +499,16 @@ batch.set(logRef, {
 // ===== Logs paginados (admin) =====
 // Cursor-based (Firestore não tem OFFSET eficiente). Cliente envia ?cursor=<doc id>
 app.get("/api/admin/logs", async (req, res) => {
-const user = await getUser(req)
-   if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
+    const user = await getUser(req);
+    if (!isAdmin(user)) return res.status(403).json({ error: "forbidden" });
 
     const PAGE = 10;
     let q = db.collection("purchase_logs").orderBy("created_at", "desc").limit(PAGE + 1);
-
     if (req.query.cursor) {
         const cursorSnap = await db.collection("purchase_logs").doc(String(req.query.cursor)).get();
         if (cursorSnap.exists) q = q.startAfter(cursorSnap);
     }
-
     const snap = await q.get();
-
     const docs = snap.docs.slice(0, PAGE).map(d => {
         const data = d.data();
         return {
@@ -498,15 +523,18 @@ const user = await getUser(req)
                 : null
         };
     });
-
     const nextCursor = snap.docs.length > PAGE ? snap.docs[PAGE - 1].id : null;
-
     res.json({ items: docs, nextCursor, pageSize: PAGE });
 });
 
 // ===== Steam News Importer =====
 const NEWS_COLLECTION = "news";
 const NEWS_STEAM_GAMES_COLLECTION = "news_steam_games";
+const NEWS_SETTINGS_COLLECTION = "site_settings";
+const NEWS_SETTINGS_DOC_ID = "news";
+const HOME_CONFIG_COLLECTION = "home_config";
+const HOME_CONFIG_DOC_ID = "main";
+const DEFAULT_NEWS_GLOBAL_IMAGE = "assets/wallpapers/enhanced_ankys.png";
 let steamNewsImportRunning = false;
 const steamAnnouncementMediaCache = new Map();
 const steamTranslationCache = new Map();
@@ -1263,6 +1291,125 @@ function steamSummaryFromHtmlServer(html) {
         .slice(0, 240);
 }
 
+
+function normalizeLocalAssetPathServer(value) {
+    let raw = String(value || "").trim();
+    if (!raw || /^(data:image|blob:|https?:\/\/|\/\/)/i.test(raw) || /base64/i.test(raw)) return "";
+    raw = raw.replace(/^\/+/, "");
+    if (!/^assets\//i.test(raw)) return "";
+    if (/["'<>`]/.test(raw)) return "";
+    return raw;
+}
+
+function normalizeNewsSettingsServer(settings) {
+    const s = settings || {};
+    const arr = Array.isArray(s.homeNewsImages) ? s.homeNewsImages : (Array.isArray(s.globalImages) ? s.globalImages : []);
+    return {
+        globalImage1: normalizeLocalAssetPathServer(arr[0] || s.globalImage1 || s.homeImage1 || s.newsGlobalImage1 || s.globalImage) || DEFAULT_NEWS_GLOBAL_IMAGE,
+        globalImage2: normalizeLocalAssetPathServer(arr[1] || s.globalImage2 || s.homeImage2 || s.newsGlobalImage2) || "",
+        globalImage3: normalizeLocalAssetPathServer(arr[2] || s.globalImage3 || s.homeImage3 || s.newsGlobalImage3) || "",
+        globalImage4: normalizeLocalAssetPathServer(arr[3] || s.globalImage4 || s.homeImage4 || s.newsGlobalImage4) || ""
+    };
+}
+
+function getNewsDateValueServer(news) {
+    if (!news) return Date.now();
+    if (typeof news.createdAt === "number") return news.createdAt;
+    if (news.createdAt && typeof news.createdAt.toMillis === "function") return news.createdAt.toMillis();
+    if (news.createdAt && typeof news.createdAt.seconds === "number") return news.createdAt.seconds * 1000;
+    if (news.date) {
+        const parsed = Date.parse(news.date);
+        if (!Number.isNaN(parsed)) return parsed;
+    }
+    return Date.now();
+}
+
+function normalizeNewsStatusServer(news) {
+    const raw = String((news && news.status) || "").toLowerCase();
+    if (["published", "pending", "draft", "archived"].includes(raw)) return raw;
+    if (news && news.archived) return "archived";
+    if (news && news.pendingApproval) return "pending";
+    if (news && news.draft) return "draft";
+    return "published";
+}
+
+function isNewsVisiblePublicServer(news) {
+    return normalizeNewsStatusServer(news) === "published" && !(news && news.hidden === true);
+}
+
+async function reserveNextNewsHomeImageServer() {
+    const ref = db.collection(NEWS_SETTINGS_COLLECTION).doc(NEWS_SETTINGS_DOC_ID);
+    return db.runTransaction(async tx => {
+        const snap = await tx.get(ref);
+        const raw = snap.exists ? (snap.data() || {}) : {};
+        const settings = normalizeNewsSettingsServer(raw);
+        const images = [settings.globalImage1, settings.globalImage2, settings.globalImage3, settings.globalImage4]
+            .map(normalizeLocalAssetPathServer).filter(Boolean);
+        const usable = images.length ? images : [DEFAULT_NEWS_GLOBAL_IMAGE];
+        const rawLast = Number(raw.lastUsedImageIndex);
+        const nextIndex = Number.isFinite(rawLast) ? (rawLast + 1) % usable.length : 0;
+        tx.set(ref, {
+            lastUsedImageIndex: nextIndex,
+            lastUsedHomeImage: usable[nextIndex],
+            lastUsedHomeImageAt: Date.now()
+        }, { merge: true });
+        return { homeImage: usable[nextIndex], homeImageSlot: nextIndex + 1 };
+    });
+}
+
+function buildHomeConfigItemServer(news, index) {
+    const createdAt = getNewsDateValueServer(news);
+    const homeImage = normalizeLocalAssetPathServer(news && (news.homeImage || news.homeCardImage))
+        || (index === 0 ? DEFAULT_NEWS_GLOBAL_IMAGE : "");
+    const titlePt = news.titlePt || (news.title && news.title.pt) || news.title || "";
+    const titleEn = news.titleEn || (news.title && news.title.en) || titlePt;
+    const summaryPt = news.summaryPt || (news.summary && news.summary.pt) || "";
+    const summaryEn = news.summaryEn || (news.summary && news.summary.en) || summaryPt;
+    return {
+        id: news.id || "",
+        link: news.id || "",
+        title: { pt: titlePt, en: titleEn },
+        titlePt,
+        titleEn,
+        summary: { pt: summaryPt, en: summaryEn },
+        summaryPt,
+        summaryEn,
+        category: news.category || "steam",
+        source: news.source || "steam",
+        date: news.date || new Date(createdAt).toISOString().split("T")[0],
+        createdAt,
+        homeImage,
+        homeCardImage: homeImage,
+        status: "published",
+        hidden: false
+    };
+}
+
+async function updateHomeConfigMainServer() {
+    const snap = await db.collection(NEWS_COLLECTION).orderBy("createdAt", "desc").limit(10).get();
+    const items = [];
+    snap.forEach(doc => items.push({ id: doc.id, ...doc.data() }));
+    const latest = items.filter(isNewsVisiblePublicServer).sort((a, b) => getNewsDateValueServer(b) - getNewsDateValueServer(a)).slice(0, 3);
+    const payload = {
+        news: latest.map(buildHomeConfigItemServer),
+        updatedAt: Date.now()
+    };
+    await db.collection(HOME_CONFIG_COLLECTION).doc(HOME_CONFIG_DOC_ID).set(payload, { merge: true });
+    return payload;
+}
+
+async function attachHomeImageToNewNewsRecordServer(record) {
+    if (normalizeLocalAssetPathServer(record && record.homeImage)) return record;
+    const choice = await reserveNextNewsHomeImageServer();
+    return {
+        ...record,
+        homeImage: choice.homeImage,
+        homeCardImage: choice.homeImage,
+        homeImageSlot: choice.homeImageSlot,
+        globalImageSlot: String(choice.homeImageSlot)
+    };
+}
+
 async function buildSteamNewsRecordServer(game, item) {
     const appId = String(game.appId || game.appid || "").trim();
     const gid = String(item.gid || item.id || item.url || item.title || "");
@@ -1389,8 +1536,11 @@ async function importSteamNewsForGame(game) {
             }
             continue;
         }
-        await ref.set(await buildSteamNewsRecordServer(game, item), { merge: true });
+        await ref.set(await attachHomeImageToNewNewsRecordServer(await buildSteamNewsRecordServer(game, item)), { merge: true });
         created += 1;
+    }
+    if (created > 0) {
+        try { await updateHomeConfigMainServer(); } catch (err) { console.warn("[home_config] atualização após import Steam falhou:", err.message); }
     }
     return created;
 }
@@ -1483,19 +1633,92 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
     }
 });
 
+async function handleSteamNewsCronImport(req, res) {
+    if (!String(CRON_SECRET || "").trim()) {
+        return res.status(503).json({ error: "cron_secret_not_configured" });
+    }
+    if (!isValidCronSecret(req)) {
+        return res.status(403).json({ error: "forbidden" });
+    }
+    try {
+        const result = await runSteamNewsAutoImport();
+        res.json({ ok: true, trigger: "cron", ...result });
+    } catch (err) {
+        console.error("[steam-news-cron] erro:", err);
+        res.status(502).json({ error: "steam_import_failed" });
+    }
+}
 
-
-// ===== Healthcheck para aquecer Render antes do Stripe =====
-app.get("/api/health", (_req, res) => {
-    res.set("Cache-Control", "no-store");
-    res.json({
-        ok: true,
-        service: "lugh-premium-api",
-        timestamp: Date.now()
-    });
-});
+app.get("/api/cron/steam-news/import", handleSteamNewsCronImport);
+app.post("/api/cron/steam-news/import", handleSteamNewsCronImport);
 
 // ===== Healthcheck =====
 app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
+
+// ===== Manifest dinâmico de assets =====
+// Varre /assets em tempo real. Permite adicionar imagens sem rebuild.
+// O frontend (assets-bridge.js) tenta este endpoint primeiro e cai no
+// arquivo estático /assets/assets-manifest.json se este host não estiver
+// disponível (ex.: site servido em outro domínio).
+const fs = require("fs");
+const path = require("path");
+const ASSETS_DIR = path.join(__dirname, "assets");
+const ASSET_FOLDERS = {
+    "Lugs":              "lugs",
+    "Lugs Prismaticos":  "lugsPrismaticos",
+    "Loot":              "loot",
+    "Wallpapers":        "wallpapers",
+    "UI Icons":          "uiIcons",
+    "Maps":              "maps",
+    "Map icons":         "mapIcons"
+};
+const IMG_RX = /\.(png|jpe?g|gif|webp|avif|svg|bmp|ico)$/i;
+function resolveAssetDir(folderName) {
+    const direct = path.join(ASSETS_DIR, folderName);
+    if (fs.existsSync(direct)) return direct;
+    const lower = path.join(ASSETS_DIR, folderName.toLowerCase());
+    if (fs.existsSync(lower)) return lower;
+    return direct;
+}
+
+function listAssetImagesRecursive(dir, prefix = "") {
+    if (!fs.existsSync(dir)) return [];
+    const out = [];
+    for (const item of fs.readdirSync(dir)) {
+        if (item.startsWith(".")) continue;
+        const full = path.join(dir, item);
+        const rel = prefix ? path.posix.join(prefix, item) : item;
+        const st = fs.statSync(full);
+        if (st.isDirectory()) out.push(...listAssetImagesRecursive(full, rel));
+        else if (IMG_RX.test(item)) out.push(rel);
+    }
+    return out;
+}
+
+app.get("/api/assets-manifest", (_req, res) => {
+    try {
+        const out = {};
+        for (const folder of Object.keys(ASSET_FOLDERS)) {
+            out[ASSET_FOLDERS[folder]] = listAssetImagesRecursive(resolveAssetDir(folder))
+                .sort((a, b) => a.localeCompare(b, "pt-BR", { sensitivity: "base" }));
+        }
+        res.set("Cache-Control", "no-cache");
+        res.json(out);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+const steamAutoImportMinutes = Math.max(0, Number(STEAM_NEWS_AUTO_IMPORT_MINUTES) || 0);
+if (steamAutoImportMinutes > 0) {
+    const steamAutoImportMs = steamAutoImportMinutes * 60 * 1000;
+    setTimeout(() => {
+        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import inicial falhou:", err));
+    }, 30000);
+    setInterval(() => {
+        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import falhou:", err));
+    }, steamAutoImportMs);
+    console.log(`[steam-news] importacao automatica ativa a cada ${steamAutoImportMinutes} minuto(s).`);
+}
 
 app.listen(PORT, () => console.log(`Lugh Premium API rodando em :${PORT}`));
