@@ -34,7 +34,7 @@ const {
     DISCORD_CLIENT_ID = "",
     DISCORD_CLIENT_SECRET = "",
     DISCORD_REDIRECT_URI = "",
-    STEAM_NEWS_AUTO_IMPORT_MINUTES = "1440",
+    STEAM_NEWS_AUTO_IMPORT_MINUTES = "0",
     CRON_SECRET = "",
     PORT = 8787
 } = process.env;
@@ -583,6 +583,180 @@ function steamDocId(appId, gid) {
     return `steam_${steamDocKey(appId, gid)}`.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 140);
 }
 
+
+function normalizeSteamDedupeTextServer(value) {
+    return String(value || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[’'`´]/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function normalizeSteamDedupeUrlServer(value) {
+    const safe = safeSteamHttpUrl(value);
+    if (!safe) return "";
+    try {
+        const url = new URL(safe);
+        url.hash = "";
+        url.search = "";
+        const pathname = url.pathname.replace(/\/+$/g, "");
+        return `${url.protocol}//${url.hostname.toLowerCase()}${pathname}`.toLowerCase();
+    } catch (_) {
+        return safe.toLowerCase().split("#")[0].split("?")[0].replace(/\/+$/g, "");
+    }
+}
+
+function steamDateKeyServer(value) {
+    if (!value) return "";
+    if (typeof value === "number" && Number.isFinite(value)) {
+        const ms = value > 100000000000 ? value : value * 1000;
+        return new Date(ms).toISOString().slice(0, 10);
+    }
+    const raw = String(value || "").trim();
+    if (/^\d+$/.test(raw)) return steamDateKeyServer(Number(raw));
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString().slice(0, 10);
+    return raw.slice(0, 10);
+}
+
+function steamNewsIdentityServer(game, item, record) {
+    const appId = String(game && (game.appId || game.appid) || record && record.steam && record.steam.appId || "").trim();
+    const gid = String(item && (item.gid || item.id) || record && record.steam && record.steam.gid || "").trim();
+    const sourceUrl = safeSteamHttpUrl(
+        item && (item.resolved_url || item.url)
+        || record && (record.sourceUrl || record.steam && record.steam.url || record.original && record.original.url)
+    );
+    const urls = [
+        sourceUrl,
+        item && item.resolved_url,
+        item && item.url,
+        record && record.sourceUrl,
+        record && record.steam && record.steam.url,
+        record && record.original && record.original.url
+    ].map(safeSteamHttpUrl).filter(Boolean);
+    const normalizedUrls = Array.from(new Set(urls.map(normalizeSteamDedupeUrlServer).filter(Boolean)));
+    const rawTitle = item && item.title
+        || record && (record.titleEn || record.titlePt || record.title && (record.title.en || record.title.pt))
+        || "";
+    const titleNorm = normalizeSteamDedupeTextServer(stripEmojiFromNewsTitle(rawTitle));
+    const dateKey = steamDateKeyServer(record && (record.date || record.createdAt) || item && item.date);
+    return {
+        appId,
+        gid,
+        key: steamDocKey(appId, gid),
+        docId: steamDocId(appId, gid),
+        sourceUrl,
+        urls: Array.from(new Set(urls)),
+        normalizedUrls,
+        titleNorm,
+        dateKey
+    };
+}
+
+function isSameSteamNewsRecordServer(news, identity) {
+    if (!news || !identity) return false;
+    const source = String(news.source || news.category || "").toLowerCase();
+    const category = String(news.category || "").toLowerCase();
+    const isSteam = source === "steam" || category === "steam" || !!news.steam || !!news.steamKey;
+    if (!isSteam) return false;
+
+    const existingKey = String(news.steamKey || "").trim();
+    if (existingKey && identity.key && existingKey === identity.key) return true;
+
+    const existingGid = String(news.steam && news.steam.gid || "").trim();
+    const existingAppId = String(news.steam && news.steam.appId || "").trim();
+    if (existingGid && identity.gid && existingGid === identity.gid
+        && (!existingAppId || !identity.appId || existingAppId === identity.appId)) {
+        return true;
+    }
+
+    const existingUrls = [
+        news.sourceUrl,
+        news.steam && news.steam.url,
+        news.original && news.original.url
+    ].map(normalizeSteamDedupeUrlServer).filter(Boolean);
+    if (existingUrls.some(url => identity.normalizedUrls.includes(url))) return true;
+
+    const existingTitle = normalizeSteamDedupeTextServer(stripEmojiFromNewsTitle(
+        news.titleEn || news.titlePt || news.title && (news.title.en || news.title.pt) || ""
+    ));
+    const existingDate = steamDateKeyServer(news.date || news.createdAt);
+    if (existingTitle && identity.titleNorm && existingTitle === identity.titleNorm) {
+        if (!existingDate || !identity.dateKey || existingDate === identity.dateKey) return true;
+    }
+    return false;
+}
+
+async function findExistingSteamNewsDocServer(game, item, record) {
+    const identity = steamNewsIdentityServer(game, item, record);
+    const collection = db.collection(NEWS_COLLECTION);
+    const visited = new Set();
+    const testSnap = snap => {
+        if (!snap || !snap.exists || visited.has(snap.id)) return null;
+        visited.add(snap.id);
+        const data = snap.data() || {};
+        return isSameSteamNewsRecordServer(data, identity) ? { ref: snap.ref, id: snap.id, data } : null;
+    };
+
+    if (identity.docId) {
+        const direct = testSnap(await collection.doc(identity.docId).get());
+        if (direct) return direct;
+    }
+
+    const queryJobs = [];
+    const addWhere = (field, value) => {
+        const clean = String(value || "").trim();
+        if (clean) queryJobs.push(collection.where(field, "==", clean).limit(3));
+    };
+    addWhere("steamKey", identity.key);
+    addWhere("steam.gid", identity.gid);
+    identity.urls.forEach(url => {
+        addWhere("sourceUrl", url);
+        addWhere("steam.url", url);
+        addWhere("original.url", url);
+    });
+    const rawTitle = record && (record.titleEn || record.titlePt || record.title && (record.title.en || record.title.pt))
+        || item && item.title
+        || "";
+    addWhere("titleEn", stripEmojiFromNewsTitle(rawTitle));
+    addWhere("title.pt", stripEmojiFromNewsTitle(rawTitle));
+
+    for (const query of queryJobs) {
+        try {
+            const snap = await query.get();
+            for (const doc of snap.docs) {
+                const match = testSnap(doc);
+                if (match) return match;
+            }
+        } catch (err) {
+            console.warn("[steam-news] consulta de duplicidade ignorada:", err.message);
+        }
+    }
+    return null;
+}
+
+function shouldRebuildSteamNewsServer(existing) {
+    const contentPt = existing && (existing.contentPt || existing.content && existing.content.pt);
+    const contentEn = existing && (existing.contentEn || existing.content && existing.content.en);
+    return Number(existing && existing.formattingVersion || 0) < 10
+        || !steamTextLooksPortuguese(contentPt, contentEn);
+}
+
+function mergeSteamNewsRecordServer(rebuilt, existing) {
+    return {
+        ...rebuilt,
+        status: existing && existing.status || rebuilt.status,
+        hidden: existing && existing.hidden === true,
+        createdAt: existing && existing.createdAt || rebuilt.createdAt,
+        homeImage: existing && (existing.homeImage || existing.homeCardImage) || rebuilt.homeImage,
+        homeCardImage: existing && (existing.homeCardImage || existing.homeImage) || rebuilt.homeCardImage,
+        homeImageSlot: existing && existing.homeImageSlot || rebuilt.homeImageSlot,
+        globalImageSlot: existing && existing.globalImageSlot || rebuilt.globalImageSlot
+    };
+}
+
 function convertSteamListBlocksServer(html, steamTag, htmlTag) {
     const rx = new RegExp("\\[" + steamTag + "\\]([\\s\\S]*?)\\[\\/" + steamTag + "\\]", "gi");
     let previous = "";
@@ -874,12 +1048,59 @@ function extractSteamLinkImage(html) {
     return "";
 }
 
+function extractSteamImageFileFromValueServer(value) {
+    const match = String(value || "").match(/"?([^"'\s]+\.(?:png|jpe?g|webp|gif))"?/i);
+    return match ? match[1].replace(/^\/+/, "") : "";
+}
+
 function extractSteamLocalizedImageFile(decodedHtml, field) {
+    const source = String(decodedHtml || "");
     const escapedField = String(field || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const arrayMatch = String(decodedHtml || "").match(new RegExp(`"${escapedField}"\\s*:\\s*\\[([\\s\\S]*?)\\]`, "i"));
-    if (!arrayMatch) return "";
-    const fileMatch = arrayMatch[1].match(/"([^"]+\.(?:png|jpe?g|webp|gif))"/i);
-    return fileMatch ? fileMatch[1].replace(/^\/+/, "") : "";
+    const patterns = [
+        new RegExp(`"${escapedField}"\\s*:\\s*\\[([\\s\\S]*?)\\]`, "i"),
+        new RegExp(`"${escapedField}"\\s*:\\s*\\{([\\s\\S]*?)\\}`, "i"),
+        new RegExp(`"${escapedField}"\\s*:\\s*"([^"]+\\.(?:png|jpe?g|webp|gif))"`, "i")
+    ];
+    for (const pattern of patterns) {
+        const match = source.match(pattern);
+        const file = match && extractSteamImageFileFromValueServer(match[1]);
+        if (file) return file;
+    }
+    return "";
+}
+
+function extractSteamAnnouncementScopedBlock(decodedHtml, detailId) {
+    const source = String(decodedHtml || "");
+    const id = String(detailId || "").trim();
+    if (!source || !id) return "";
+    const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const gidPatterns = [
+        new RegExp(`"gid"\\s*:\\s*"${escapedId}"`, "i"),
+        new RegExp(`"gid"\\s*:\\s*${escapedId}(?!\\d)`, "i"),
+        new RegExp(`"event_gid"\\s*:\\s*"${escapedId}"`, "i"),
+        new RegExp(`/announcements/detail/${escapedId}(?!\\d)`, "i")
+    ];
+    let gidIndex = -1;
+    for (const pattern of gidPatterns) {
+        const match = source.match(pattern);
+        if (match && (gidIndex < 0 || match.index < gidIndex)) gidIndex = match.index;
+    }
+    if (gidIndex < 0) return "";
+
+    const prevAnnouncement = source.lastIndexOf('"announcement_body"', gidIndex);
+    const start = prevAnnouncement >= 0 && gidIndex - prevAnnouncement < 30000
+        ? prevAnnouncement
+        : Math.max(0, gidIndex - 8000);
+    const nextAnnouncement = source.indexOf('"announcement_body"', gidIndex + 20);
+    const end = nextAnnouncement > gidIndex
+        ? nextAnnouncement
+        : Math.min(source.length, gidIndex + 60000);
+    return source.slice(start, end);
+}
+
+function extractSteamScopedLocalizedImageFile(decodedHtml, field, detailId) {
+    const scoped = extractSteamAnnouncementScopedBlock(decodedHtml, detailId);
+    return scoped ? extractSteamLocalizedImageFile(scoped, field) : "";
 }
 
 function steamClanImageBase(...urls) {
@@ -894,12 +1115,15 @@ function steamClanImageBase(...urls) {
 function extractSteamAnnouncementMedia(html, finalUrl) {
     const source = String(html || "");
     const decoded = decodeSteamAnnouncementMarkup(source);
+    const detailId = getSteamAnnouncementDetailId(finalUrl);
     const ogImage = extractSteamMetaImage(source, "og:image");
     const twitterImage = extractSteamMetaImage(source, "twitter:image");
     const linkedImage = extractSteamLinkImage(source);
     const imageBase = steamClanImageBase(ogImage, twitterImage, linkedImage);
-    const titleFile = extractSteamLocalizedImageFile(decoded, "localized_title_image");
-    const capsuleFile = extractSteamLocalizedImageFile(decoded, "localized_capsule_image");
+    // Importante: Steam pode colocar varias noticias no mesmo HTML.
+    // Nunca usar localized_title_image da pagina inteira; precisa pertencer ao gid atual.
+    const titleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId);
+    const capsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId);
     const titleImage = safeSteamHttpUrl(imageBase && titleFile ? imageBase + titleFile : "");
     const capsuleImage = safeSteamHttpUrl(imageBase && capsuleFile ? imageBase + capsuleFile : "")
         || ogImage
@@ -908,7 +1132,9 @@ function extractSteamAnnouncementMedia(html, finalUrl) {
     return {
         titleImage,
         capsuleImage,
-        imageUrl: titleImage || capsuleImage,
+        // imageUrl fica reservado para capa exclusiva da noticia.
+        // capsule/og sao genericos em alguns anuncios e podem repetir o mesmo banner.
+        imageUrl: titleImage || "",
         resolvedUrl: safeSteamHttpUrl(finalUrl),
         publishedAt: extractSteamMetaContent(source, "article:published_time")
     };
@@ -1018,25 +1244,56 @@ async function fetchSteamNewsPayload(appid, count = 10) {
     return payload;
 }
 
-function getSteamExplicitCoverServer(item) {
-    const source = item || {};
-    const candidates = [
-        source.steam_title_image,
-        source.image_url,
-        source.imageUrl,
-        source.image,
-        source.thumbnail,
-        source.thumbnail_url,
-        source.capsule_image,
-        source.capsuleImage,
-        source.header_image,
-        source.steam_capsule_image
-    ];
-    for (const candidate of candidates) {
+function firstSafeSteamUrlServer(candidates) {
+    for (const candidate of candidates || []) {
         const safe = safeSteamHttpUrl(candidate);
         if (safe) return safe;
     }
     return "";
+}
+
+function getSteamExplicitCoverServer(item) {
+    const source = item || {};
+    // Somente imagens exclusivas do anuncio. Nao usar capsule/og aqui,
+    // pois sao imagens genericas que podem repetir em varias noticias.
+    return firstSafeSteamUrlServer([
+        source.steam_title_image,
+        source.titleImage,
+        source.localized_title_image,
+        source.title_image
+    ]);
+}
+
+function getSteamContentCoverServer(contentImages) {
+    const list = Array.isArray(contentImages) ? contentImages : [];
+    for (const img of list) {
+        const safe = safeSteamHttpUrl(img && img.url || img);
+        if (safe) return safe;
+    }
+    return "";
+}
+
+function getSteamFallbackCoverServer(item) {
+    const source = item || {};
+    // Fallback final: pode ser capsule/og/header. Usado apenas quando nao
+    // existe title image nem imagem no conteudo da noticia.
+    return firstSafeSteamUrlServer([
+        source.steam_capsule_image,
+        source.capsuleImage,
+        source.capsule_image,
+        source.header_image,
+        source.image_url,
+        source.imageUrl,
+        source.image,
+        source.thumbnail,
+        source.thumbnail_url
+    ]);
+}
+
+function getSteamBestCoverServer(item, contentImages) {
+    return getSteamExplicitCoverServer(item)
+        || getSteamContentCoverServer(contentImages)
+        || getSteamFallbackCoverServer(item);
 }
 
 function getSteamPublishedDateServer(item, timestamp) {
@@ -1430,12 +1687,23 @@ async function buildSteamNewsRecordServer(game, item) {
             : "english-fallback";
     }
     const contentImages = extractSteamImagesServer(`${htmlEn}${htmlPt}`);
-    const explicitCover = getSteamExplicitCoverServer(item);
-    const coverImage = explicitCover;
-    const images = contentImages.map(img => ({ ...img, cover: false }));
-    if (explicitCover) {
-        images.unshift({ url: explicitCover, alt: titlePt || titleEn, caption: "", cover: true, order: -1 });
-    }
+    const coverImage = getSteamBestCoverServer(item, contentImages);
+    const images = [];
+    const addSteamImage = (img, cover, order) => {
+        const url = safeSteamHttpUrl(img && img.url || img);
+        if (!url) return;
+        const comparable = comparableSteamImageUrlServer(url);
+        if (images.some(existing => comparableSteamImageUrlServer(existing.url) === comparable)) return;
+        images.push({
+            url,
+            alt: String(img && img.alt || (cover ? (titlePt || titleEn) : "")).trim(),
+            caption: String(img && img.caption || "").trim(),
+            cover: !!cover,
+            order
+        });
+    };
+    if (coverImage) addSteamImage({ url: coverImage, alt: titlePt || titleEn }, true, -1);
+    contentImages.forEach((img, index) => addSteamImage(img, false, index));
     const bodyHtmlEn = coverImage ? removeSteamCoverFromBodyServer(htmlEn, coverImage) : htmlEn;
     const bodyHtmlPt = coverImage ? removeSteamCoverFromBodyServer(htmlPt, coverImage) : htmlPt;
     const summaryEn = steamSummaryFromHtmlServer(bodyHtmlEn);
@@ -1488,7 +1756,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 9,
+        formattingVersion: 10,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
@@ -1500,46 +1768,39 @@ async function importSteamNewsForGame(game) {
     const payload = await fetchSteamNewsPayload(game.appId, 10);
     const items = (payload && payload.appnews && payload.appnews.newsitems) || [];
     let created = 0;
+    let changed = false;
     for (const item of items) {
         const gid = String(item.gid || item.id || item.url || item.title || "");
         if (!gid) continue;
-        const key = steamDocKey(game.appId, gid);
-        const ref = db.collection(NEWS_COLLECTION).doc(steamDocId(game.appId, gid));
-        const snap = await ref.get();
-        if (snap.exists) {
-            const existing = snap.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
-                || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
+
+        const existingMatch = await findExistingSteamNewsDocServer(game, item);
+        if (existingMatch) {
+            if (shouldRebuildSteamNewsServer(existingMatch.data)) {
                 const rebuilt = await buildSteamNewsRecordServer(game, item);
-                await ref.set({
-                    ...rebuilt,
-                    status: existing.status || rebuilt.status,
-                    hidden: existing.hidden === true,
-                    createdAt: existing.createdAt || rebuilt.createdAt
-                }, { merge: true });
+                await existingMatch.ref.set(mergeSteamNewsRecordServer(rebuilt, existingMatch.data), { merge: true });
+                changed = true;
             }
             continue;
         }
-        const duplicate = await db.collection(NEWS_COLLECTION).where("steamKey", "==", key).limit(1).get();
-        if (!duplicate.empty) {
-            const duplicateDoc = duplicate.docs[0];
-            const existing = duplicateDoc.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
-                || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
-                const rebuilt = await buildSteamNewsRecordServer(game, item);
-                await duplicateDoc.ref.set({
-                    ...rebuilt,
-                    status: existing.status || rebuilt.status,
-                    hidden: existing.hidden === true,
-                    createdAt: existing.createdAt || rebuilt.createdAt
-                }, { merge: true });
+
+        const rebuilt = await buildSteamNewsRecordServer(game, item);
+        const duplicateAfterBuild = await findExistingSteamNewsDocServer(game, item, rebuilt);
+        if (duplicateAfterBuild) {
+            if (shouldRebuildSteamNewsServer(duplicateAfterBuild.data)) {
+                await duplicateAfterBuild.ref.set(mergeSteamNewsRecordServer(rebuilt, duplicateAfterBuild.data), { merge: true });
+                changed = true;
             }
             continue;
         }
-        await ref.set(await attachHomeImageToNewNewsRecordServer(await buildSteamNewsRecordServer(game, item)), { merge: true });
+
+        const identity = steamNewsIdentityServer(game, item, rebuilt);
+        await db.collection(NEWS_COLLECTION)
+            .doc(identity.docId)
+            .set(await attachHomeImageToNewNewsRecordServer(rebuilt), { merge: true });
         created += 1;
+        changed = true;
     }
-    if (created > 0) {
+    if (changed) {
         try { await updateHomeConfigMainServer(); } catch (err) { console.warn("[home_config] atualização após import Steam falhou:", err.message); }
     }
     return created;
