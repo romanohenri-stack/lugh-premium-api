@@ -512,6 +512,7 @@ let steamNewsImportRunning = false;
 const steamAnnouncementMediaCache = new Map();
 const steamTranslationCache = new Map();
 const STEAM_ANNOUNCEMENT_CACHE_MS = 6 * 60 * 60 * 1000;
+const STEAM_NEWS_FORMATTING_VERSION = 14;
 
 function escapeSteamHtml(value) {
     return String(value || "")
@@ -956,13 +957,37 @@ async function fetchSteamAnnouncementMedia(url) {
     }
 }
 
+function getSteamApiCoverFromItemServer(item) {
+    const source = item || {};
+    const candidates = [
+        source.steam_api_image_url,
+        source.api_image_url,
+        source.image_url,
+        source.imageUrl,
+        source.image,
+        source.thumbnail,
+        source.thumbnail_url,
+        source.header_image
+    ];
+    for (const candidate of candidates) {
+        const safe = safeSteamHttpUrl(candidate);
+        if (safe) return safe;
+    }
+    return "";
+}
+
 async function enrichSteamNewsItemServer(item) {
     if (!item) return item;
+    const steamApiImageUrl = getSteamApiCoverFromItemServer(item);
     try {
         const media = await fetchSteamAnnouncementMedia(item.url);
         return {
             ...item,
-            image_url: media.imageUrl || "",
+            // Nunca sobrescrever a capa própria do item da API da Steam com
+            // localized_title_image global da página. A página pode listar várias
+            // notícias e repetir o primeiro banner em itens diferentes.
+            steam_api_image_url: steamApiImageUrl,
+            image_url: steamApiImageUrl || safeSteamHttpUrl(item.image_url) || "",
             steam_title_image: media.titleImage || "",
             steam_capsule_image: media.capsuleImage || "",
             steam_published_at: media.publishedAt || "",
@@ -971,7 +996,11 @@ async function enrichSteamNewsItemServer(item) {
         };
     } catch (err) {
         console.warn("[steam-news] capa do anuncio indisponivel:", item.url, err.message);
-        return item;
+        return {
+            ...item,
+            steam_api_image_url: steamApiImageUrl,
+            image_url: steamApiImageUrl || safeSteamHttpUrl(item.image_url) || ""
+        };
     }
 }
 
@@ -993,17 +1022,17 @@ async function fetchSteamNewsPayload(appid, count = 10) {
 
 function getSteamExplicitCoverServer(item) {
     const source = item || {};
+    const apiCover = getSteamApiCoverFromItemServer(source);
+    if (apiCover) return apiCover;
+
     const candidates = [
-        source.steam_title_image,
-        source.image_url,
-        source.imageUrl,
-        source.image,
-        source.thumbnail,
-        source.thumbnail_url,
+        // Fallbacks somente quando a API não entrega imagem própria.
+        // steam_title_image/capsule podem vir da página agregada da Steam, por
+        // isso ficam depois da imagem real do item para evitar banner repetido.
         source.capsule_image,
         source.capsuleImage,
-        source.header_image,
-        source.steam_capsule_image
+        source.steam_capsule_image,
+        source.steam_title_image
     ];
     for (const candidate of candidates) {
         const safe = safeSteamHttpUrl(candidate);
@@ -1342,7 +1371,7 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 9,
+        formattingVersion: STEAM_NEWS_FORMATTING_VERSION,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
@@ -1362,7 +1391,7 @@ async function importSteamNewsForGame(game) {
         const snap = await ref.get();
         if (snap.exists) {
             const existing = snap.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
+            if (Number(existing.formattingVersion || 0) < STEAM_NEWS_FORMATTING_VERSION
                 || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
                 const rebuilt = await buildSteamNewsRecordServer(game, item);
                 await ref.set({
@@ -1378,7 +1407,7 @@ async function importSteamNewsForGame(game) {
         if (!duplicate.empty) {
             const duplicateDoc = duplicate.docs[0];
             const existing = duplicateDoc.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
+            if (Number(existing.formattingVersion || 0) < STEAM_NEWS_FORMATTING_VERSION
                 || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
                 const rebuilt = await buildSteamNewsRecordServer(game, item);
                 await duplicateDoc.ref.set({
