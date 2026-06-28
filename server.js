@@ -34,7 +34,8 @@ const {
     DISCORD_CLIENT_ID = "",
     DISCORD_CLIENT_SECRET = "",
     DISCORD_REDIRECT_URI = "",
-    STEAM_NEWS_AUTO_IMPORT_MINUTES = "30",
+    STEAM_NEWS_AUTO_IMPORT_MINUTES = "0",
+    CRON_SECRET = "",
     PORT = 8787
 } = process.env;
 
@@ -51,6 +52,9 @@ const ADMINS = ADMIN_EMAILS.split(",").map(s => s.trim().toLowerCase());
 // ===== APP =====
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
+// Preflight explicito para chamadas com Authorization do frontend Netlify.
+// Mantem o checkout acessivel mesmo quando o navegador envia OPTIONS antes do POST.
+app.options("*", cors({ origin: true, credentials: true }));
 
 // IMPORTANTE: a rota de webhook precisa do body RAW. Ela é declarada ANTES
 // do express.json() para que o middleware JSON não consuma o stream.
@@ -113,6 +117,26 @@ async function getUser(req) {
 }
 function isAdmin(user) {
     return user && user.email && ADMINS.includes(user.email.toLowerCase());
+}
+
+function getCronSecret(req) {
+    return String(
+        req.headers["x-cron-secret"]
+        || req.headers.authorization && req.headers.authorization.replace(/^Bearer\s+/i, "")
+        || req.query && req.query.secret
+        || req.body && req.body.secret
+        || ""
+    ).trim();
+}
+
+function isValidCronSecret(req) {
+    const expected = String(CRON_SECRET || "").trim();
+    const received = getCronSecret(req);
+    if (!expected || !received) return false;
+    const expectedBuffer = Buffer.from(expected);
+    const receivedBuffer = Buffer.from(received);
+    return expectedBuffer.length === receivedBuffer.length
+        && crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
 }
 
 
@@ -197,6 +221,97 @@ function discordPublicPayload(data) {
         discordAvatar: data.discordAvatar || "",
         discordLinkedAt: data.discordLinkedAt || null
     };
+}
+
+
+function discordApiHeaders(extra = {}) {
+    return {
+        Accept: "application/json",
+        "User-Agent": "LughWorldCommunity/1.0 (+https://lughworldcommunity.netlify.app)",
+        ...extra
+    };
+}
+
+function compactDiscordErrorBody(value) {
+    return String(value || "")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 280);
+}
+
+function waitDiscordRetry(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchDiscordTokenWithRetry(body) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+            const response = await fetch("https://discord.com/api/oauth2/token", {
+                method: "POST",
+                signal: controller.signal,
+                headers: discordApiHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),
+                body
+            });
+            const text = await response.text();
+            let payload = {};
+            try {
+                payload = text ? JSON.parse(text) : {};
+            } catch (_) {
+                payload = {};
+            }
+
+            if (response.ok && payload.access_token) return payload;
+
+            const compactBody = compactDiscordErrorBody(text);
+            const isCloudflareHtml = /cloudflare|cf-error|ray id|just a moment/i.test(text);
+            const errorCode = payload.error || payload.message || (isCloudflareHtml ? "cloudflare_html" : "discord_token_failed");
+            const err = new Error(String(errorCode));
+            err.status = response.status;
+            err.body = compactBody;
+            err.attempt = attempt;
+            lastError = err;
+            console.error("[discord-token] erro:", response.status, String(errorCode), compactBody);
+
+            // Nao repetir quando o Discord/Cloudflare retornar 429.
+            // Cada retry conta como nova tentativa e pode prolongar o bloqueio.
+            if (attempt < 2 && response.status !== 429 && (response.status >= 500 || isCloudflareHtml)) {
+                await waitDiscordRetry(900);
+                continue;
+            }
+            throw err;
+        } catch (err) {
+            clearTimeout(timeout);
+            if (err && err.name === "AbortError") {
+                const timeoutErr = new Error("discord_token_timeout");
+                timeoutErr.status = 408;
+                timeoutErr.attempt = attempt;
+                lastError = timeoutErr;
+                console.error("[discord-token] erro:", 408, "discord_token_timeout");
+                if (attempt < 2) {
+                    await waitDiscordRetry(900);
+                    continue;
+                }
+                throw timeoutErr;
+            }
+            if (err && err.status) throw err;
+            lastError = err;
+            console.error("[discord-token] erro:", err && err.message ? err.message : err);
+            if (attempt < 2) {
+                await waitDiscordRetry(900);
+                continue;
+            }
+            throw err;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+    throw lastError || new Error("discord_token_failed");
 }
 
 app.post("/api/auth/discord/start", async (req, res) => {
@@ -297,25 +412,22 @@ app.get("/api/auth/discord/callback", async (req, res) => {
 
     try {
         const redirectUri = getDiscordRedirectUri(req);
-        const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-                client_id: DISCORD_CLIENT_ID,
-                client_secret: DISCORD_CLIENT_SECRET,
-                grant_type: "authorization_code",
-                code,
-                redirect_uri: redirectUri
-            })
-        });
-        const tokenData = await tokenRes.json().catch(() => ({}));
-        if (!tokenRes.ok || !tokenData.access_token) throw new Error(tokenData.error || "discord_token_failed");
+        const tokenData = await fetchDiscordTokenWithRetry(new URLSearchParams({
+            client_id: DISCORD_CLIENT_ID,
+            client_secret: DISCORD_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: redirectUri
+        }));
 
         const userRes = await fetch("https://discord.com/api/users/@me", {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+            headers: discordApiHeaders({ Authorization: `Bearer ${tokenData.access_token}` })
         });
         const discordUser = await userRes.json().catch(() => ({}));
-        if (!userRes.ok || !discordUser.id) throw new Error(discordUser.message || "discord_user_failed");
+        if (!userRes.ok || !discordUser.id) {
+            console.error("[discord-me] erro:", userRes.status, discordUser.message || discordUser.error || "discord_user_failed");
+            throw new Error(discordUser.message || discordUser.error || "discord_user_failed");
+        }
 
         const profile = {
             discordId: String(discordUser.id),
@@ -331,7 +443,8 @@ app.get("/api/auth/discord/callback", async (req, res) => {
         sendHtml(true, { discord: discordPublicPayload(profile), returnTo: stateData.returnTo });
     } catch (err) {
         console.error("[discord-oauth] erro:", err);
-        sendHtml(false, { error: err.message || "discord_link_failed", returnTo: withDiscordReturnStatus(stateData && stateData.returnTo, "error") });
+        const discordStatus = err && err.status === 429 ? "rate_limited" : "error";
+        sendHtml(false, { error: err.message || "discord_link_failed", returnTo: withDiscordReturnStatus(stateData && stateData.returnTo, discordStatus) });
     }
 });
 
@@ -379,55 +492,65 @@ app.post("/api/admin/settings/featured-price", async (req, res) => {
 // ===== Checkout =====
 // O frontend chama isso ao marcar "Destaque Premium" no card.
 app.post("/api/checkout", async (req, res) => {
-    const user = await getUser(req);
-    if (!user) return res.status(401).json({ error: "auth required" });
+    try {
+        const user = await getUser(req);
+        if (!user) return res.status(401).json({ error: "auth required" });
 
-    const { listingId } = req.body || {};
-    if (!listingId || typeof listingId !== "string" || listingId.length > 128) {
-        return res.status(400).json({ error: "listingId inválido" });
-    }
+        const { listingId } = req.body || {};
+        if (!listingId || typeof listingId !== "string" || listingId.length > 128) {
+            return res.status(400).json({ error: "listingId inválido" });
+        }
 
-    // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
-    // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
-    const listingRef = db.collection("listings").doc(listingId);
-    const listingSnap = await listingRef.get();
-    if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
-    const listing = listingSnap.data();
-    const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
-    if (ownerEmail && ownerEmail !== user.email.toLowerCase()) {
-        return res.status(403).json({ error: "anúncio não pertence ao usuário" });
-    }
-    if (listing.is_featured === true) {
-        return res.status(409).json({ error: "anúncio já é destaque" });
-    }
+        // Confirma que o anúncio existe e pertence ao usuário (a coleção pode variar
+        // no seu projeto — ajuste o nome se necessário; aqui usamos "listings").
+        const listingRef = db.collection("listings").doc(listingId);
+        const listingSnap = await listingRef.get();
+        if (!listingSnap.exists) return res.status(404).json({ error: "anúncio não encontrado" });
+        const listing = listingSnap.data() || {};
+        const ownerEmail = (listing.ownerEmail || listing.authorEmail || listing.seller_email || "").toLowerCase();
+        if (ownerEmail && ownerEmail !== String(user.email || "").toLowerCase()) {
+            return res.status(403).json({ error: "anúncio não pertence ao usuário" });
+        }
+        if (listing.is_featured === true) {
+            return res.status(409).json({ error: "anúncio já é destaque" });
+        }
 
-    const cents = await getFeaturedPriceCents();
+        const cents = await getFeaturedPriceCents();
+        const siteUrl = String(PUBLIC_SITE_URL || req.headers.origin || "https://lughworldcommunity.netlify.app").replace(/\/+$/, "");
 
-    const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
-        line_items: [{
-            price_data: {
-                currency: "brl",
-                product_data: {
-                    name: `Destaque Premium — Anúncio ${listingId}`,
-                    description: "Aura dourada + prioridade no topo da listagem"
+        const session = await stripe.checkout.sessions.create({
+            mode: "payment",
+            payment_method_types: ["card", "pix"], // Cartão + Pix (QR Code gerado pelo Stripe)
+            line_items: [{
+                price_data: {
+                    currency: "brl",
+                    product_data: {
+                        name: `Destaque Premium — Anúncio ${listingId}`,
+                        description: "Aura dourada + prioridade no topo da listagem"
+                    },
+                    unit_amount: cents
                 },
-                unit_amount: cents
+                quantity: 1
+            }],
+            customer_email: user.email,
+            metadata: {
+                listingId,
+                userId: user.uid,
+                userEmail: user.email
             },
-            quantity: 1
-        }],
-        customer_email: user.email,
-        metadata: {
-            listingId,
-            userId: user.uid,
-            userEmail: user.email
-        },
-        success_url: `${PUBLIC_SITE_URL}/?premium=success&listing=${encodeURIComponent(listingId)}`,
-        cancel_url: `${PUBLIC_SITE_URL}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
-    });
+            success_url: `${siteUrl}/?premium=success&listing=${encodeURIComponent(listingId)}`,
+            cancel_url: `${siteUrl}/?premium=cancel&listing=${encodeURIComponent(listingId)}`
+        });
 
-    res.json({ url: session.url, id: session.id });
+        return res.json({ url: session.url, id: session.id });
+    } catch (err) {
+        console.error("[checkout] erro:", err && err.message ? err.message : err);
+        const status = Number(err && (err.statusCode || err.status)) || 500;
+        return res.status(status >= 400 && status < 600 ? status : 500).json({
+            error: "checkout_failed",
+            message: err && err.message ? String(err.message) : "Erro ao iniciar pagamento"
+        });
+    }
 });
 
 // ===== Lógica do pagamento confirmado =====
@@ -560,6 +683,180 @@ function steamDocKey(appId, gid) {
 
 function steamDocId(appId, gid) {
     return `steam_${steamDocKey(appId, gid)}`.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 140);
+}
+
+
+function normalizeSteamDedupeTextServer(value) {
+    return String(value || "")
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[’'`´]/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function normalizeSteamDedupeUrlServer(value) {
+    const safe = safeSteamHttpUrl(value);
+    if (!safe) return "";
+    try {
+        const url = new URL(safe);
+        url.hash = "";
+        url.search = "";
+        const pathname = url.pathname.replace(/\/+$/g, "");
+        return `${url.protocol}//${url.hostname.toLowerCase()}${pathname}`.toLowerCase();
+    } catch (_) {
+        return safe.toLowerCase().split("#")[0].split("?")[0].replace(/\/+$/g, "");
+    }
+}
+
+function steamDateKeyServer(value) {
+    if (!value) return "";
+    if (typeof value === "number" && Number.isFinite(value)) {
+        const ms = value > 100000000000 ? value : value * 1000;
+        return new Date(ms).toISOString().slice(0, 10);
+    }
+    const raw = String(value || "").trim();
+    if (/^\d+$/.test(raw)) return steamDateKeyServer(Number(raw));
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return new Date(parsed).toISOString().slice(0, 10);
+    return raw.slice(0, 10);
+}
+
+function steamNewsIdentityServer(game, item, record) {
+    const appId = String(game && (game.appId || game.appid) || record && record.steam && record.steam.appId || "").trim();
+    const gid = String(item && (item.gid || item.id) || record && record.steam && record.steam.gid || "").trim();
+    const sourceUrl = safeSteamHttpUrl(
+        item && (item.resolved_url || item.url)
+        || record && (record.sourceUrl || record.steam && record.steam.url || record.original && record.original.url)
+    );
+    const urls = [
+        sourceUrl,
+        item && item.resolved_url,
+        item && item.url,
+        record && record.sourceUrl,
+        record && record.steam && record.steam.url,
+        record && record.original && record.original.url
+    ].map(safeSteamHttpUrl).filter(Boolean);
+    const normalizedUrls = Array.from(new Set(urls.map(normalizeSteamDedupeUrlServer).filter(Boolean)));
+    const rawTitle = item && item.title
+        || record && (record.titleEn || record.titlePt || record.title && (record.title.en || record.title.pt))
+        || "";
+    const titleNorm = normalizeSteamDedupeTextServer(stripEmojiFromNewsTitle(rawTitle));
+    const dateKey = steamDateKeyServer(record && (record.date || record.createdAt) || item && item.date);
+    return {
+        appId,
+        gid,
+        key: steamDocKey(appId, gid),
+        docId: steamDocId(appId, gid),
+        sourceUrl,
+        urls: Array.from(new Set(urls)),
+        normalizedUrls,
+        titleNorm,
+        dateKey
+    };
+}
+
+function isSameSteamNewsRecordServer(news, identity) {
+    if (!news || !identity) return false;
+    const source = String(news.source || news.category || "").toLowerCase();
+    const category = String(news.category || "").toLowerCase();
+    const isSteam = source === "steam" || category === "steam" || !!news.steam || !!news.steamKey;
+    if (!isSteam) return false;
+
+    const existingKey = String(news.steamKey || "").trim();
+    if (existingKey && identity.key && existingKey === identity.key) return true;
+
+    const existingGid = String(news.steam && news.steam.gid || "").trim();
+    const existingAppId = String(news.steam && news.steam.appId || "").trim();
+    if (existingGid && identity.gid && existingGid === identity.gid
+        && (!existingAppId || !identity.appId || existingAppId === identity.appId)) {
+        return true;
+    }
+
+    const existingUrls = [
+        news.sourceUrl,
+        news.steam && news.steam.url,
+        news.original && news.original.url
+    ].map(normalizeSteamDedupeUrlServer).filter(Boolean);
+    if (existingUrls.some(url => identity.normalizedUrls.includes(url))) return true;
+
+    const existingTitle = normalizeSteamDedupeTextServer(stripEmojiFromNewsTitle(
+        news.titleEn || news.titlePt || news.title && (news.title.en || news.title.pt) || ""
+    ));
+    const existingDate = steamDateKeyServer(news.date || news.createdAt);
+    if (existingTitle && identity.titleNorm && existingTitle === identity.titleNorm) {
+        if (!existingDate || !identity.dateKey || existingDate === identity.dateKey) return true;
+    }
+    return false;
+}
+
+async function findExistingSteamNewsDocServer(game, item, record) {
+    const identity = steamNewsIdentityServer(game, item, record);
+    const collection = db.collection(NEWS_COLLECTION);
+    const visited = new Set();
+    const testSnap = snap => {
+        if (!snap || !snap.exists || visited.has(snap.id)) return null;
+        visited.add(snap.id);
+        const data = snap.data() || {};
+        return isSameSteamNewsRecordServer(data, identity) ? { ref: snap.ref, id: snap.id, data } : null;
+    };
+
+    if (identity.docId) {
+        const direct = testSnap(await collection.doc(identity.docId).get());
+        if (direct) return direct;
+    }
+
+    const queryJobs = [];
+    const addWhere = (field, value) => {
+        const clean = String(value || "").trim();
+        if (clean) queryJobs.push(collection.where(field, "==", clean).limit(3));
+    };
+    addWhere("steamKey", identity.key);
+    addWhere("steam.gid", identity.gid);
+    identity.urls.forEach(url => {
+        addWhere("sourceUrl", url);
+        addWhere("steam.url", url);
+        addWhere("original.url", url);
+    });
+    const rawTitle = record && (record.titleEn || record.titlePt || record.title && (record.title.en || record.title.pt))
+        || item && item.title
+        || "";
+    addWhere("titleEn", stripEmojiFromNewsTitle(rawTitle));
+    addWhere("title.pt", stripEmojiFromNewsTitle(rawTitle));
+
+    for (const query of queryJobs) {
+        try {
+            const snap = await query.get();
+            for (const doc of snap.docs) {
+                const match = testSnap(doc);
+                if (match) return match;
+            }
+        } catch (err) {
+            console.warn("[steam-news] consulta de duplicidade ignorada:", err.message);
+        }
+    }
+    return null;
+}
+
+function shouldRebuildSteamNewsServer(existing) {
+    const contentPt = existing && (existing.contentPt || existing.content && existing.content.pt);
+    const contentEn = existing && (existing.contentEn || existing.content && existing.content.en);
+    return Number(existing && existing.formattingVersion || 0) < 13
+        || !steamTextLooksPortuguese(contentPt, contentEn);
+}
+
+function mergeSteamNewsRecordServer(rebuilt, existing) {
+    return {
+        ...rebuilt,
+        status: existing && existing.status || rebuilt.status,
+        hidden: existing && existing.hidden === true,
+        createdAt: existing && existing.createdAt || rebuilt.createdAt,
+        homeImage: existing && (existing.homeImage || existing.homeCardImage) || rebuilt.homeImage,
+        homeCardImage: existing && (existing.homeCardImage || existing.homeImage) || rebuilt.homeCardImage,
+        homeImageSlot: existing && existing.homeImageSlot || rebuilt.homeImageSlot,
+        globalImageSlot: existing && existing.globalImageSlot || rebuilt.globalImageSlot
+    };
 }
 
 function convertSteamListBlocksServer(html, steamTag, htmlTag) {
@@ -805,14 +1102,24 @@ function decodeSteamJsonString(value) {
     }
 }
 
-function getSteamAnnouncementDetailId(url) {
+function getSteamAnnouncementDetailId(url, fallbackId = "") {
     const safe = safeSteamHttpUrl(url);
-    const match = safe && safe.match(/\/announcements\/detail\/(\d+)/i);
-    return match ? match[1] : "";
+    const patterns = [
+        /\/announcements\/detail\/(\d+)/i,
+        /\/news\/app\/\d+\/view\/(\d+)/i,
+        /\/news\/app\/\d+\/detail\/(\d+)/i,
+        /[?&](?:gid|newsid|event_gid)=(\d+)/i
+    ];
+    for (const pattern of patterns) {
+        const match = safe && safe.match(pattern);
+        if (match && match[1]) return match[1];
+    }
+    const fallbackMatch = String(fallbackId || "").match(/\d{6,}/);
+    return fallbackMatch ? fallbackMatch[0] : "";
 }
 
-function extractSteamAnnouncementLocalization(html, finalUrl) {
-    const detailId = getSteamAnnouncementDetailId(finalUrl);
+function extractSteamAnnouncementLocalization(html, finalUrl, preferredDetailId = "") {
+    const detailId = getSteamAnnouncementDetailId(finalUrl, preferredDetailId);
     if (!detailId) return { title: "", content: "" };
     const source = decodeSteamHtmlEntities(html);
     const escapedId = detailId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -853,12 +1160,59 @@ function extractSteamLinkImage(html) {
     return "";
 }
 
+function extractSteamImageFileFromValueServer(value) {
+    const match = String(value || "").match(/"?([^"'\s]+\.(?:png|jpe?g|webp|gif))"?/i);
+    return match ? match[1].replace(/^\/+/, "") : "";
+}
+
 function extractSteamLocalizedImageFile(decodedHtml, field) {
+    const source = String(decodedHtml || "");
     const escapedField = String(field || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const arrayMatch = String(decodedHtml || "").match(new RegExp(`"${escapedField}"\\s*:\\s*\\[([\\s\\S]*?)\\]`, "i"));
-    if (!arrayMatch) return "";
-    const fileMatch = arrayMatch[1].match(/"([^"]+\.(?:png|jpe?g|webp|gif))"/i);
-    return fileMatch ? fileMatch[1].replace(/^\/+/, "") : "";
+    const patterns = [
+        new RegExp(`"${escapedField}"\\s*:\\s*\\[([\\s\\S]*?)\\]`, "i"),
+        new RegExp(`"${escapedField}"\\s*:\\s*\\{([\\s\\S]*?)\\}`, "i"),
+        new RegExp(`"${escapedField}"\\s*:\\s*"([^"]+\\.(?:png|jpe?g|webp|gif))"`, "i")
+    ];
+    for (const pattern of patterns) {
+        const match = source.match(pattern);
+        const file = match && extractSteamImageFileFromValueServer(match[1]);
+        if (file) return file;
+    }
+    return "";
+}
+
+function extractSteamAnnouncementScopedBlock(decodedHtml, detailId) {
+    const source = String(decodedHtml || "");
+    const id = String(detailId || "").trim();
+    if (!source || !id) return "";
+    const escapedId = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const gidPatterns = [
+        new RegExp(`"gid"\\s*:\\s*"${escapedId}"`, "i"),
+        new RegExp(`"gid"\\s*:\\s*${escapedId}(?!\\d)`, "i"),
+        new RegExp(`"event_gid"\\s*:\\s*"${escapedId}"`, "i"),
+        new RegExp(`/announcements/detail/${escapedId}(?!\\d)`, "i")
+    ];
+    let gidIndex = -1;
+    for (const pattern of gidPatterns) {
+        const match = source.match(pattern);
+        if (match && (gidIndex < 0 || match.index < gidIndex)) gidIndex = match.index;
+    }
+    if (gidIndex < 0) return "";
+
+    const prevAnnouncement = source.lastIndexOf('"announcement_body"', gidIndex);
+    const start = prevAnnouncement >= 0 && gidIndex - prevAnnouncement < 30000
+        ? prevAnnouncement
+        : Math.max(0, gidIndex - 8000);
+    const nextAnnouncement = source.indexOf('"announcement_body"', gidIndex + 20);
+    const end = nextAnnouncement > gidIndex
+        ? nextAnnouncement
+        : Math.min(source.length, gidIndex + 60000);
+    return source.slice(start, end);
+}
+
+function extractSteamScopedLocalizedImageFile(decodedHtml, field, detailId) {
+    const scoped = extractSteamAnnouncementScopedBlock(decodedHtml, detailId);
+    return scoped ? extractSteamLocalizedImageFile(scoped, field) : "";
 }
 
 function steamClanImageBase(...urls) {
@@ -870,20 +1224,24 @@ function steamClanImageBase(...urls) {
     return "";
 }
 
-function extractSteamAnnouncementMedia(html, finalUrl) {
+function extractSteamAnnouncementMedia(html, finalUrl, preferredDetailId = "") {
     const source = String(html || "");
     const decoded = decodeSteamAnnouncementMarkup(source);
+    const detailId = getSteamAnnouncementDetailId(finalUrl, preferredDetailId);
     const ogImage = extractSteamMetaImage(source, "og:image");
     const twitterImage = extractSteamMetaImage(source, "twitter:image");
     const linkedImage = extractSteamLinkImage(source);
     const imageBase = steamClanImageBase(ogImage, twitterImage, linkedImage);
-    const titleFile = extractSteamLocalizedImageFile(decoded, "localized_title_image");
-    const capsuleFile = extractSteamLocalizedImageFile(decoded, "localized_capsule_image");
+    // Com GID conhecido, só aceita title/capsule do bloco dessa notícia.
+    // Não usa localized_title_image global como capa, pois a página da Steam
+    // pode conter cards de outras notícias e isso troca o banner entre posts.
+    const scopedTitleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_title_image", detailId);
+    const scopedCapsuleFile = extractSteamScopedLocalizedImageFile(decoded, "localized_capsule_image", detailId);
+    const titleFile = scopedTitleFile || (!detailId ? extractSteamLocalizedImageFile(decoded, "localized_title_image") : "");
+    const capsuleFile = scopedCapsuleFile || (!detailId ? extractSteamLocalizedImageFile(decoded, "localized_capsule_image") : "");
     const titleImage = safeSteamHttpUrl(imageBase && titleFile ? imageBase + titleFile : "");
     const capsuleImage = safeSteamHttpUrl(imageBase && capsuleFile ? imageBase + capsuleFile : "")
-        || ogImage
-        || twitterImage
-        || linkedImage;
+        || (!detailId ? (ogImage || twitterImage || linkedImage) : "");
     return {
         titleImage,
         capsuleImage,
@@ -908,7 +1266,7 @@ function isAllowedSteamAnnouncementUrl(value) {
     }
 }
 
-async function fetchSteamAnnouncementMedia(url) {
+async function fetchSteamAnnouncementMedia(url, preferredDetailId = "") {
     const safeUrl = safeSteamHttpUrl(url);
     if (!isAllowedSteamAnnouncementUrl(safeUrl)) return { titleImage: "", capsuleImage: "", imageUrl: "", resolvedUrl: safeUrl };
     const cached = steamAnnouncementMediaCache.get(safeUrl);
@@ -947,10 +1305,10 @@ async function fetchSteamAnnouncementMedia(url) {
     if (!primaryPage) throw (ptResult.reason || enResult.reason || new Error("steam_announcement_unavailable"));
 
     try {
-        const media = extractSteamAnnouncementMedia(primaryPage.html, withoutSteamLanguage(primaryPage.url));
+        const media = extractSteamAnnouncementMedia(primaryPage.html, withoutSteamLanguage(primaryPage.url), preferredDetailId);
         media.localized = {
-            pt: ptPage ? extractSteamAnnouncementLocalization(ptPage.html, ptPage.url) : { title: "", content: "" },
-            en: enPage ? extractSteamAnnouncementLocalization(enPage.html, enPage.url) : { title: "", content: "" }
+            pt: ptPage ? extractSteamAnnouncementLocalization(ptPage.html, ptPage.url, preferredDetailId) : { title: "", content: "" },
+            en: enPage ? extractSteamAnnouncementLocalization(enPage.html, enPage.url, preferredDetailId) : { title: "", content: "" }
         };
         steamAnnouncementMediaCache.set(safeUrl, { savedAt: Date.now(), media });
         if (media.resolvedUrl && media.resolvedUrl !== safeUrl) {
@@ -965,10 +1323,21 @@ async function fetchSteamAnnouncementMedia(url) {
 async function enrichSteamNewsItemServer(item) {
     if (!item) return item;
     try {
-        const media = await fetchSteamAnnouncementMedia(item.url);
+        const media = await fetchSteamAnnouncementMedia(item.url, item.gid || item.id);
+        const apiImage = firstSafeSteamUrlServer([
+            item.image_url,
+            item.imageUrl,
+            item.image,
+            item.thumbnail,
+            item.thumbnail_url
+        ]);
         return {
             ...item,
-            image_url: media.imageUrl || "",
+            // Mantém a imagem vinda da API do item como fonte principal.
+            // O fetch da página só complementa; ele não pode sobrescrever
+            // com banner global de outro post da Central de Notícias.
+            image_url: apiImage || media.titleImage || media.imageUrl || "",
+            steam_api_image_url: apiImage || "",
             steam_title_image: media.titleImage || "",
             steam_capsule_image: media.capsuleImage || "",
             steam_published_at: media.publishedAt || "",
@@ -981,7 +1350,7 @@ async function enrichSteamNewsItemServer(item) {
     }
 }
 
-async function fetchSteamNewsPayload(appid, count = 10) {
+async function fetchSteamNewsPayload(appid, count = 10, options = {}) {
     const url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${encodeURIComponent(appid)}&count=${count}&maxlength=0&format=json`;
     const steamRes = await fetch(url, { headers: { Accept: "application/json" } });
     if (!steamRes.ok) {
@@ -991,18 +1360,30 @@ async function fetchSteamNewsPayload(appid, count = 10) {
     }
     const payload = await steamRes.json();
     const items = payload && payload.appnews && payload.appnews.newsitems;
-    if (Array.isArray(items)) {
+    const shouldEnrich = !options || options.enrich !== false;
+    if (Array.isArray(items) && shouldEnrich) {
         payload.appnews.newsitems = await Promise.all(items.map(enrichSteamNewsItemServer));
     }
     return payload;
 }
 
+function firstSafeSteamUrlServer(candidates) {
+    for (const candidate of candidates || []) {
+        const safe = safeSteamHttpUrl(candidate);
+        if (safe) return safe;
+    }
+    return "";
+}
+
 function getSteamExplicitCoverServer(item) {
     const source = item || {};
-    const candidates = [
-        source.steam_title_image,
+    return firstSafeSteamUrlServer([
+        // Primeiro usa a capa que veio junto do item da API Steam.
+        // Ela pertence ao card correto da notícia e evita misturar banners.
+        source.steam_api_image_url,
         source.image_url,
         source.imageUrl,
+        source.steam_title_image,
         source.image,
         source.thumbnail,
         source.thumbnail_url,
@@ -1010,12 +1391,39 @@ function getSteamExplicitCoverServer(item) {
         source.capsuleImage,
         source.header_image,
         source.steam_capsule_image
-    ];
-    for (const candidate of candidates) {
-        const safe = safeSteamHttpUrl(candidate);
+    ]);
+}
+
+function getSteamContentCoverServer(contentImages) {
+    const list = Array.isArray(contentImages) ? contentImages : [];
+    for (const img of list) {
+        const safe = safeSteamHttpUrl(img && img.url || img);
         if (safe) return safe;
     }
     return "";
+}
+
+function getSteamFallbackCoverServer(item) {
+    const source = item || {};
+    // Fallback final: pode ser capsule/og/header. Usado apenas quando nao
+    // existe title image nem imagem no conteudo da noticia.
+    return firstSafeSteamUrlServer([
+        source.steam_capsule_image,
+        source.capsuleImage,
+        source.capsule_image,
+        source.header_image,
+        source.image_url,
+        source.imageUrl,
+        source.image,
+        source.thumbnail,
+        source.thumbnail_url
+    ]);
+}
+
+function getSteamBestCoverServer(item, contentImages) {
+    return getSteamExplicitCoverServer(item)
+        || getSteamContentCoverServer(contentImages)
+        || getSteamFallbackCoverServer(item);
 }
 
 function getSteamPublishedDateServer(item, timestamp) {
@@ -1467,74 +1875,80 @@ async function buildSteamNewsRecordServer(game, item) {
                     ? "Steam did not provide PT-BR; the English announcement was translated automatically."
                     : "Steam did not provide PT-BR and automatic translation was unavailable; English was used as fallback."
         },
-        formattingVersion: 9,
+        formattingVersion: 13,
         date: getSteamPublishedDateServer(item, timestamp),
         createdAt: timestamp,
         updatedAt: Date.now()
     };
 }
 
-async function importSteamNewsForGame(game) {
+function steamNewsItemAlreadyEnrichedServer(item) {
+    return !!(item && (item.steam_localized || item.steam_title_image || item.image_url || item.resolved_url));
+}
+
+async function ensureSteamNewsItemEnrichedServer(item) {
+    return steamNewsItemAlreadyEnrichedServer(item) ? item : await enrichSteamNewsItemServer(item);
+}
+
+async function importSteamNewsForGame(game, options = {}) {
     if (!game || game.enabled === false || !game.appId) return 0;
-    const payload = await fetchSteamNewsPayload(game.appId, 10);
+    const reprocessExisting = options.reprocessExisting !== false;
+    const enrichPayload = options.enrichPayload !== false;
+    const count = Math.max(1, Math.min(20, Number(options.count) || 10));
+    const payload = await fetchSteamNewsPayload(game.appId, count, { enrich: enrichPayload });
     const items = (payload && payload.appnews && payload.appnews.newsitems) || [];
     let created = 0;
-    for (const item of items) {
-        const gid = String(item.gid || item.id || item.url || item.title || "");
+    let changed = false;
+    for (const rawItem of items) {
+        const gid = String(rawItem && (rawItem.gid || rawItem.id || rawItem.url || rawItem.title) || "");
         if (!gid) continue;
-        const key = steamDocKey(game.appId, gid);
-        const ref = db.collection(NEWS_COLLECTION).doc(steamDocId(game.appId, gid));
-        const snap = await ref.get();
-        if (snap.exists) {
-            const existing = snap.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
-                || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
-                const rebuilt = await buildSteamNewsRecordServer(game, item);
-                await ref.set({
-                    ...rebuilt,
-                    status: existing.status || rebuilt.status,
-                    hidden: existing.hidden === true,
-                    createdAt: existing.createdAt || rebuilt.createdAt
-                }, { merge: true });
+
+        const existingMatch = await findExistingSteamNewsDocServer(game, rawItem);
+        if (existingMatch) {
+            if (reprocessExisting && shouldRebuildSteamNewsServer(existingMatch.data)) {
+                const enrichedItem = await ensureSteamNewsItemEnrichedServer(rawItem);
+                const rebuilt = await buildSteamNewsRecordServer(game, enrichedItem);
+                await existingMatch.ref.set(mergeSteamNewsRecordServer(rebuilt, existingMatch.data), { merge: true });
+                changed = true;
             }
             continue;
         }
-        const duplicate = await db.collection(NEWS_COLLECTION).where("steamKey", "==", key).limit(1).get();
-        if (!duplicate.empty) {
-            const duplicateDoc = duplicate.docs[0];
-            const existing = duplicateDoc.data() || {};
-            if (Number(existing.formattingVersion || 0) < 9
-                || !steamTextLooksPortuguese(existing.contentPt || existing.content && existing.content.pt, existing.contentEn || existing.content && existing.content.en)) {
-                const rebuilt = await buildSteamNewsRecordServer(game, item);
-                await duplicateDoc.ref.set({
-                    ...rebuilt,
-                    status: existing.status || rebuilt.status,
-                    hidden: existing.hidden === true,
-                    createdAt: existing.createdAt || rebuilt.createdAt
-                }, { merge: true });
+
+        const enrichedItem = await ensureSteamNewsItemEnrichedServer(rawItem);
+        const rebuilt = await buildSteamNewsRecordServer(game, enrichedItem);
+        const duplicateAfterBuild = await findExistingSteamNewsDocServer(game, rawItem, rebuilt);
+        if (duplicateAfterBuild) {
+            if (reprocessExisting && shouldRebuildSteamNewsServer(duplicateAfterBuild.data)) {
+                await duplicateAfterBuild.ref.set(mergeSteamNewsRecordServer(rebuilt, duplicateAfterBuild.data), { merge: true });
+                changed = true;
             }
             continue;
         }
-        await ref.set(await attachHomeImageToNewNewsRecordServer(await buildSteamNewsRecordServer(game, item)), { merge: true });
+
+        const identity = steamNewsIdentityServer(game, enrichedItem, rebuilt);
+        await db.collection(NEWS_COLLECTION)
+            .doc(identity.docId)
+            .set(await attachHomeImageToNewNewsRecordServer(rebuilt), { merge: true });
         created += 1;
+        changed = true;
     }
-    if (created > 0) {
+    if (changed) {
         try { await updateHomeConfigMainServer(); } catch (err) { console.warn("[home_config] atualização após import Steam falhou:", err.message); }
     }
     return created;
 }
 
-async function runSteamNewsAutoImport() {
+async function runSteamNewsAutoImport(options = {}) {
     if (steamNewsImportRunning) return { skipped: true, created: 0 };
     steamNewsImportRunning = true;
     try {
         const snap = await db.collection(NEWS_STEAM_GAMES_COLLECTION).where("enabled", "==", true).get();
         let created = 0;
         for (const doc of snap.docs) {
-            created += await importSteamNewsForGame({ id: doc.id, ...doc.data() });
+            created += await importSteamNewsForGame({ id: doc.id, ...doc.data() }, options);
         }
         if (created > 0) console.log(`[steam-news] ${created} noticia(s) importada(s) automaticamente.`);
-        return { skipped: false, created };
+        return { skipped: false, created, mode: options.mode || (options.reprocessExisting === false ? "light" : "full") };
     } finally {
         steamNewsImportRunning = false;
     }
@@ -1566,7 +1980,7 @@ app.get("/api/steam-announcement-cover", async (req, res) => {
     }
 
     try {
-        const media = await fetchSteamAnnouncementMedia(url);
+        const media = await fetchSteamAnnouncementMedia(url, req.query.gid || req.query.id || "");
         res.set("Cache-Control", "public, max-age=21600");
         res.json(media);
     } catch (err) {
@@ -1611,6 +2025,33 @@ app.post("/api/admin/steam-news/import", async (req, res) => {
         res.status(502).json({ error: "steam_import_failed" });
     }
 });
+
+async function handleSteamNewsCronImport(req, res) {
+    if (!String(CRON_SECRET || "").trim()) {
+        return res.status(503).json({ error: "cron_secret_not_configured" });
+    }
+    if (!isValidCronSecret(req)) {
+        return res.status(403).json({ error: "forbidden" });
+    }
+
+    if (steamNewsImportRunning) {
+        return res.json({ ok: true, trigger: "cron", queued: false, skipped: true, reason: "already_running" });
+    }
+
+    setTimeout(() => {
+        runSteamNewsAutoImport({
+            mode: "light",
+            reprocessExisting: false,
+            enrichPayload: false,
+            count: 10
+        }).catch(err => console.error("[steam-news-cron] importacao em segundo plano falhou:", err));
+    }, 0);
+
+    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
+}
+
+app.get("/api/cron/steam-news/import", handleSteamNewsCronImport);
+app.post("/api/cron/steam-news/import", handleSteamNewsCronImport);
 
 // ===== Healthcheck =====
 app.get("/", (_req, res) => res.send("Lugh Premium API ok"));
@@ -1673,10 +2114,10 @@ const steamAutoImportMinutes = Math.max(0, Number(STEAM_NEWS_AUTO_IMPORT_MINUTES
 if (steamAutoImportMinutes > 0) {
     const steamAutoImportMs = steamAutoImportMinutes * 60 * 1000;
     setTimeout(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import inicial falhou:", err));
+        runSteamNewsAutoImport({ mode: "light", reprocessExisting: false, enrichPayload: false, count: 10 }).catch(err => console.error("[steam-news] auto import inicial falhou:", err));
     }, 30000);
     setInterval(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import falhou:", err));
+        runSteamNewsAutoImport({ mode: "light", reprocessExisting: false, enrichPayload: false, count: 10 }).catch(err => console.error("[steam-news] auto import falhou:", err));
     }, steamAutoImportMs);
     console.log(`[steam-news] importacao automatica ativa a cada ${steamAutoImportMinutes} minuto(s).`);
 }
