@@ -1238,7 +1238,7 @@ async function enrichSteamNewsItemServer(item) {
     }
 }
 
-async function fetchSteamNewsPayload(appid, count = 10) {
+async function fetchSteamNewsPayload(appid, count = 10, options = {}) {
     const url = `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=${encodeURIComponent(appid)}&count=${count}&maxlength=0&format=json`;
     const steamRes = await fetch(url, { headers: { Accept: "application/json" } });
     if (!steamRes.ok) {
@@ -1248,7 +1248,8 @@ async function fetchSteamNewsPayload(appid, count = 10) {
     }
     const payload = await steamRes.json();
     const items = payload && payload.appnews && payload.appnews.newsitems;
-    if (Array.isArray(items)) {
+    const shouldEnrich = !options || options.enrich !== false;
+    if (Array.isArray(items) && shouldEnrich) {
         payload.appnews.newsitems = await Promise.all(items.map(enrichSteamNewsItemServer));
     }
     return payload;
@@ -1766,37 +1767,50 @@ async function buildSteamNewsRecordServer(game, item) {
     };
 }
 
-async function importSteamNewsForGame(game) {
+function steamNewsItemAlreadyEnrichedServer(item) {
+    return !!(item && (item.steam_localized || item.steam_title_image || item.image_url || item.resolved_url));
+}
+
+async function ensureSteamNewsItemEnrichedServer(item) {
+    return steamNewsItemAlreadyEnrichedServer(item) ? item : await enrichSteamNewsItemServer(item);
+}
+
+async function importSteamNewsForGame(game, options = {}) {
     if (!game || game.enabled === false || !game.appId) return 0;
-    const payload = await fetchSteamNewsPayload(game.appId, 10);
+    const reprocessExisting = options.reprocessExisting !== false;
+    const enrichPayload = options.enrichPayload !== false;
+    const count = Math.max(1, Math.min(20, Number(options.count) || 10));
+    const payload = await fetchSteamNewsPayload(game.appId, count, { enrich: enrichPayload });
     const items = (payload && payload.appnews && payload.appnews.newsitems) || [];
     let created = 0;
     let changed = false;
-    for (const item of items) {
-        const gid = String(item.gid || item.id || item.url || item.title || "");
+    for (const rawItem of items) {
+        const gid = String(rawItem && (rawItem.gid || rawItem.id || rawItem.url || rawItem.title) || "");
         if (!gid) continue;
 
-        const existingMatch = await findExistingSteamNewsDocServer(game, item);
+        const existingMatch = await findExistingSteamNewsDocServer(game, rawItem);
         if (existingMatch) {
-            if (shouldRebuildSteamNewsServer(existingMatch.data)) {
-                const rebuilt = await buildSteamNewsRecordServer(game, item);
+            if (reprocessExisting && shouldRebuildSteamNewsServer(existingMatch.data)) {
+                const enrichedItem = await ensureSteamNewsItemEnrichedServer(rawItem);
+                const rebuilt = await buildSteamNewsRecordServer(game, enrichedItem);
                 await existingMatch.ref.set(mergeSteamNewsRecordServer(rebuilt, existingMatch.data), { merge: true });
                 changed = true;
             }
             continue;
         }
 
-        const rebuilt = await buildSteamNewsRecordServer(game, item);
-        const duplicateAfterBuild = await findExistingSteamNewsDocServer(game, item, rebuilt);
+        const enrichedItem = await ensureSteamNewsItemEnrichedServer(rawItem);
+        const rebuilt = await buildSteamNewsRecordServer(game, enrichedItem);
+        const duplicateAfterBuild = await findExistingSteamNewsDocServer(game, rawItem, rebuilt);
         if (duplicateAfterBuild) {
-            if (shouldRebuildSteamNewsServer(duplicateAfterBuild.data)) {
+            if (reprocessExisting && shouldRebuildSteamNewsServer(duplicateAfterBuild.data)) {
                 await duplicateAfterBuild.ref.set(mergeSteamNewsRecordServer(rebuilt, duplicateAfterBuild.data), { merge: true });
                 changed = true;
             }
             continue;
         }
 
-        const identity = steamNewsIdentityServer(game, item, rebuilt);
+        const identity = steamNewsIdentityServer(game, enrichedItem, rebuilt);
         await db.collection(NEWS_COLLECTION)
             .doc(identity.docId)
             .set(await attachHomeImageToNewNewsRecordServer(rebuilt), { merge: true });
@@ -1809,17 +1823,17 @@ async function importSteamNewsForGame(game) {
     return created;
 }
 
-async function runSteamNewsAutoImport() {
+async function runSteamNewsAutoImport(options = {}) {
     if (steamNewsImportRunning) return { skipped: true, created: 0 };
     steamNewsImportRunning = true;
     try {
         const snap = await db.collection(NEWS_STEAM_GAMES_COLLECTION).where("enabled", "==", true).get();
         let created = 0;
         for (const doc of snap.docs) {
-            created += await importSteamNewsForGame({ id: doc.id, ...doc.data() });
+            created += await importSteamNewsForGame({ id: doc.id, ...doc.data() }, options);
         }
         if (created > 0) console.log(`[steam-news] ${created} noticia(s) importada(s) automaticamente.`);
-        return { skipped: false, created };
+        return { skipped: false, created, mode: options.mode || (options.reprocessExisting === false ? "light" : "full") };
     } finally {
         steamNewsImportRunning = false;
     }
@@ -1904,13 +1918,21 @@ async function handleSteamNewsCronImport(req, res) {
     if (!isValidCronSecret(req)) {
         return res.status(403).json({ error: "forbidden" });
     }
-    try {
-        const result = await runSteamNewsAutoImport();
-        res.json({ ok: true, trigger: "cron", ...result });
-    } catch (err) {
-        console.error("[steam-news-cron] erro:", err);
-        res.status(502).json({ error: "steam_import_failed" });
+
+    if (steamNewsImportRunning) {
+        return res.json({ ok: true, trigger: "cron", queued: false, skipped: true, reason: "already_running" });
     }
+
+    setTimeout(() => {
+        runSteamNewsAutoImport({
+            mode: "light",
+            reprocessExisting: false,
+            enrichPayload: false,
+            count: 10
+        }).catch(err => console.error("[steam-news-cron] importacao em segundo plano falhou:", err));
+    }, 0);
+
+    res.json({ ok: true, trigger: "cron", queued: true, mode: "light" });
 }
 
 app.get("/api/cron/steam-news/import", handleSteamNewsCronImport);
@@ -1977,10 +1999,10 @@ const steamAutoImportMinutes = Math.max(0, Number(STEAM_NEWS_AUTO_IMPORT_MINUTES
 if (steamAutoImportMinutes > 0) {
     const steamAutoImportMs = steamAutoImportMinutes * 60 * 1000;
     setTimeout(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import inicial falhou:", err));
+        runSteamNewsAutoImport({ mode: "light", reprocessExisting: false, enrichPayload: false, count: 10 }).catch(err => console.error("[steam-news] auto import inicial falhou:", err));
     }, 30000);
     setInterval(() => {
-        runSteamNewsAutoImport().catch(err => console.error("[steam-news] auto import falhou:", err));
+        runSteamNewsAutoImport({ mode: "light", reprocessExisting: false, enrichPayload: false, count: 10 }).catch(err => console.error("[steam-news] auto import falhou:", err));
     }, steamAutoImportMs);
     console.log(`[steam-news] importacao automatica ativa a cada ${steamAutoImportMinutes} minuto(s).`);
 }
